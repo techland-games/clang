@@ -236,10 +236,8 @@
   <ItemGroup>
     <VSCTCompile Include="ClangFormat.vsct">
       <ResourceName>Menus.ctmenu</ResourceName>
+      <SubType>Designer</SubType>
     </VSCTCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="Resources\Images_32bit.bmp" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="clang-format.exe">
@@ -248,6 +246,7 @@
     <Content Include="license.txt">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
+    <Resource Include="Resources\Buttons.png" />
     <Content Include="Resources\Package.ico" />
   </ItemGroup>
   <ItemGroup>
