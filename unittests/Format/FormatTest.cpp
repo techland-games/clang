@@ -7567,6 +7567,9 @@ TEST_F(FormatTest, AlignConsecutiveAssignments) {
   verifyFormat("int oneTwoThree = 123; // comment\n"
                "int oneTwo      = 12;  // comment",
                Alignment);
+  verifyFormat("for (int i = 0; i < 10; ++i)\n"
+               "  aaaaaaaaaaaaaaaaaaaaaaaa = aa;",
+               Alignment);
   EXPECT_EQ("int a = 5;\n"
             "\n"
             "int oneTwoThree = 123;",
