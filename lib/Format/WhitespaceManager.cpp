@@ -334,6 +334,10 @@ void WhitespaceManager::alignConsecutiveAssignments() {
 
   AlignTokens(Style,
               [&](const Change &C) {
+                // Do not align if it's not an assignment.
+                if (!C.Tok->is(tok::equal))
+                  return false;
+              
                 // Do not align on equal signs that are first on a line.
                 if (C.NewlinesBefore > 0)
                   return false;
@@ -342,7 +346,16 @@ void WhitespaceManager::alignConsecutiveAssignments() {
                 if (&C != &Changes.back() && (&C + 1)->NewlinesBefore > 0)
                   return false;
 
-                return C.Tok->is(tok::equal);
+                // Do no align if line starts with 'for' loop.
+                for (auto Prev = C.Tok->Previous; Prev != nullptr; Prev = Prev->Previous) {
+                  if (Prev->Previous == nullptr)
+                  {
+                    if (Prev->is(tok::kw_for))
+                      return false;
+                  }
+                }
+
+                return true;
               },
               Changes);
 }
