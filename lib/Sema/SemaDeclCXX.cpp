@@ -467,7 +467,7 @@ bool Sema::MergeCXXFunctionDecl(FunctionDecl *New, FunctionDecl *Old,
       // If only one of these is a local function declaration, then they are
       // declared in different scopes, even though isDeclInScope may think
       // they're in the same scope. (If both are local, the scope check is
-      // sufficent, and if neither is local, then they are in the same scope.)
+      // sufficient, and if neither is local, then they are in the same scope.)
       continue;
     }
 
@@ -547,17 +547,23 @@ bool Sema::MergeCXXFunctionDecl(FunctionDecl *New, FunctionDecl *Old,
       Diag(OldParam->getLocation(), diag::note_previous_definition)
         << OldParam->getDefaultArgRange();
     } else if (OldParamHasDfl) {
-      // Merge the old default argument into the new parameter.
-      // It's important to use getInit() here;  getDefaultArg()
-      // strips off any top-level ExprWithCleanups.
-      NewParam->setHasInheritedDefaultArg();
-      if (OldParam->hasUnparsedDefaultArg())
-        NewParam->setUnparsedDefaultArg();
-      else if (OldParam->hasUninstantiatedDefaultArg())
-        NewParam->setUninstantiatedDefaultArg(
-                                      OldParam->getUninstantiatedDefaultArg());
-      else
-        NewParam->setDefaultArg(OldParam->getInit());
+      // Merge the old default argument into the new parameter unless the new
+      // function is a friend declaration in a template class. In the latter
+      // case the default arguments will be inherited when the friend
+      // declaration will be instantiated.
+      if (New->getFriendObjectKind() == Decl::FOK_None ||
+          !New->getLexicalDeclContext()->isDependentContext()) {
+        // It's important to use getInit() here;  getDefaultArg()
+        // strips off any top-level ExprWithCleanups.
+        NewParam->setHasInheritedDefaultArg();
+        if (OldParam->hasUnparsedDefaultArg())
+          NewParam->setUnparsedDefaultArg();
+        else if (OldParam->hasUninstantiatedDefaultArg())
+          NewParam->setUninstantiatedDefaultArg(
+                                       OldParam->getUninstantiatedDefaultArg());
+        else
+          NewParam->setDefaultArg(OldParam->getInit());
+      }
     } else if (NewParamHasDfl) {
       if (New->getDescribedFunctionTemplate()) {
         // Paragraph 4, quoted above, only applies to non-template functions.
@@ -638,7 +644,12 @@ bool Sema::MergeCXXFunctionDecl(FunctionDecl *New, FunctionDecl *Old,
     Diag(Old->getLocation(), diag::note_previous_declaration);
     Invalid = true;
   } else if (!Old->getMostRecentDecl()->isInlined() && New->isInlined() &&
-             Old->isDefined(Def)) {
+             Old->isDefined(Def) &&
+             // If a friend function is inlined but does not have 'inline'
+             // specifier, it is a definition. Do not report attribute conflict
+             // in this case, redefinition will be diagnosed later.
+             (New->isInlineSpecified() ||
+              New->getFriendObjectKind() == Decl::FOK_None)) {
     // C++11 [dcl.fcn.spec]p4:
     //   If the definition of a function appears in a translation unit before its
     //   first declaration as inline, the program is ill-formed.
@@ -981,7 +992,8 @@ namespace { enum class IsTupleLike { TupleLike, NotTupleLike, Error }; }
 
 static IsTupleLike isTupleLike(Sema &S, SourceLocation Loc, QualType T,
                                llvm::APSInt &Size) {
-  EnterExpressionEvaluationContext ContextRAII(S, Sema::ConstantEvaluated);
+  EnterExpressionEvaluationContext ContextRAII(
+      S, Sema::ExpressionEvaluationContext::ConstantEvaluated);
 
   DeclarationName Value = S.PP.getIdentifierInfo("value");
   LookupResult R(S, Value, Loc, Sema::LookupOrdinaryName);
@@ -3766,6 +3778,15 @@ Sema::BuildMemInitializer(Decl *ConstructorD,
           if (BaseType.isNull())
             return true;
 
+          TInfo = Context.CreateTypeSourceInfo(BaseType);
+          DependentNameTypeLoc TL =
+              TInfo->getTypeLoc().castAs<DependentNameTypeLoc>();
+          if (!TL.isNull()) {
+            TL.setNameLoc(IdLoc);
+            TL.setElaboratedKeywordLoc(SourceLocation());
+            TL.setQualifierLoc(SS.getWithLocInContext(Context));
+          }
+
           R.clear();
           R.setLookupName(MemberOrBase);
         }
@@ -4399,11 +4420,8 @@ BuildImplicitMemberInitializer(Sema &SemaRef, CXXConstructorDecl *Constructor,
     }
   }
   
-  if (SemaRef.getLangOpts().ObjCAutoRefCount &&
-      FieldBaseElementType->isObjCRetainableType() &&
-      FieldBaseElementType.getObjCLifetime() != Qualifiers::OCL_None &&
-      FieldBaseElementType.getObjCLifetime() != Qualifiers::OCL_ExplicitNone) {
-    // ARC:
+  if (FieldBaseElementType.hasNonTrivialObjCLifetime()) {
+    // ARC and Weak:
     //   Default-initialize Objective-C pointers to NULL.
     CXXMemberInit
       = new (SemaRef.Context) CXXCtorInitializer(SemaRef.Context, Field, 
@@ -5455,7 +5473,7 @@ static void ReferenceDllExportedMethods(Sema &S, CXXRecordDecl *Class) {
         // Synthesize and instantiate non-trivial implicit methods, explicitly
         // defaulted methods, and the copy and move assignment operators. The
         // latter are exported even if they are trivial, because the address of
-        // an operator can be taken and should compare equal accross libraries.
+        // an operator can be taken and should compare equal across libraries.
         DiagnosticErrorTrap Trap(S.Diags);
         S.MarkFunctionReferenced(Class->getLocation(), MD);
         if (Trap.hasErrorOccurred()) {
@@ -5708,6 +5726,53 @@ static void DefineImplicitSpecialMember(Sema &S, CXXMethodDecl *MD,
   }
 }
 
+/// Determine whether a type is permitted to be passed or returned in
+/// registers, per C++ [class.temporary]p3.
+static bool computeCanPassInRegisters(Sema &S, CXXRecordDecl *D) {
+  if (D->isDependentType() || D->isInvalidDecl())
+    return false;
+
+  // Per C++ [class.temporary]p3, the relevant condition is:
+  //   each copy constructor, move constructor, and destructor of X is
+  //   either trivial or deleted, and X has at least one non-deleted copy
+  //   or move constructor
+  bool HasNonDeletedCopyOrMove = false;
+
+  if (D->needsImplicitCopyConstructor() &&
+      !D->defaultedCopyConstructorIsDeleted()) {
+    if (!D->hasTrivialCopyConstructor())
+      return false;
+    HasNonDeletedCopyOrMove = true; 
+  }
+
+  if (S.getLangOpts().CPlusPlus11 && D->needsImplicitMoveConstructor() &&
+      !D->defaultedMoveConstructorIsDeleted()) {
+    if (!D->hasTrivialMoveConstructor())
+      return false;
+    HasNonDeletedCopyOrMove = true;
+  }
+
+  if (D->needsImplicitDestructor() && !D->defaultedDestructorIsDeleted() &&
+      !D->hasTrivialDestructor())
+    return false;
+
+  for (const CXXMethodDecl *MD : D->methods()) {
+    if (MD->isDeleted())
+      continue;
+
+    auto *CD = dyn_cast<CXXConstructorDecl>(MD);
+    if (CD && CD->isCopyOrMoveConstructor())
+      HasNonDeletedCopyOrMove = true;
+    else if (!isa<CXXDestructorDecl>(MD))
+      continue;
+
+    if (!MD->isTrivial())
+      return false;
+  }
+
+  return HasNonDeletedCopyOrMove;
+}
+
 /// \brief Perform semantic checks on a class definition that has been
 /// completing, introducing implicitly-declared members, checking for
 /// abstract types, etc.
@@ -5852,6 +5917,8 @@ void Sema::CheckCompletedCXXClass(CXXRecordDecl *Record) {
   }
 
   checkClassLevelDLLAttribute(Record);
+
+  Record->setCanPassInRegisters(computeCanPassInRegisters(*this, Record));
 }
 
 /// Look up the special member function that would be called by a special
@@ -7148,8 +7215,7 @@ static bool checkTrivialClassMembers(Sema &S, CXXRecordDecl *RD,
     //   [...] nontrivally ownership-qualified types are [...] not trivially
     //   default constructible, copy constructible, move constructible, copy
     //   assignable, move assignable, or destructible [...]
-    if (S.getLangOpts().ObjCAutoRefCount &&
-        FieldType.hasNonTrivialObjCLifetime()) {
+    if (FieldType.hasNonTrivialObjCLifetime()) {
       if (Diagnose)
         S.Diag(FI->getLocation(), diag::note_nontrivial_objc_ownership)
           << RD << FieldType.getObjCLifetime();
@@ -7479,8 +7545,7 @@ void Sema::ActOnFinishCXXMemberSpecification(Scope* S, SourceLocation RLoc,
               reinterpret_cast<Decl**>(FieldCollector->getCurFields()),
               FieldCollector->getCurNumFields()), LBrac, RBrac, AttrList);
 
-  CheckCompletedCXXClass(
-                        dyn_cast_or_null<CXXRecordDecl>(TagDecl));
+  CheckCompletedCXXClass(dyn_cast_or_null<CXXRecordDecl>(TagDecl));
 }
 
 /// AddImplicitlyDeclaredMembersToClass - Adds any implicitly-declared
@@ -8448,6 +8513,7 @@ Decl *Sema::ActOnStartNamespaceDef(Scope *NamespcScope,
     Namespc->setInvalidDecl();
   
   ProcessDeclAttributeList(DeclRegionScope, Namespc, AttrList);
+  AddPragmaAttributes(DeclRegionScope, Namespc);
 
   // FIXME: Should we be merging attributes?
   if (const VisibilityAttr *Attr = Namespc->getAttr<VisibilityAttr>())
@@ -9934,6 +10000,7 @@ Decl *Sema::ActOnAliasDeclaration(Scope *S,
     NewTD->setInvalidDecl();
 
   ProcessDeclAttributeList(S, NewTD, AttrList);
+  AddPragmaAttributes(S, NewTD);
 
   CheckTypedefForVariablyModifiedType(S, NewTD);
   Invalid |= NewTD->isInvalidDecl();
@@ -10349,32 +10416,33 @@ void Sema::DefineImplicitDefaultConstructor(SourceLocation CurrentLocation,
           !Constructor->doesThisDeclarationHaveABody() &&
           !Constructor->isDeleted()) &&
     "DefineImplicitDefaultConstructor - call it for implicit default ctor");
+  if (Constructor->willHaveBody() || Constructor->isInvalidDecl())
+    return;
 
   CXXRecordDecl *ClassDecl = Constructor->getParent();
   assert(ClassDecl && "DefineImplicitDefaultConstructor - invalid constructor");
 
   SynthesizedFunctionScope Scope(*this, Constructor);
-  DiagnosticErrorTrap Trap(Diags);
-  if (SetCtorInitializers(Constructor, /*AnyErrors=*/false) ||
-      Trap.hasErrorOccurred()) {
-    Diag(CurrentLocation, diag::note_member_synthesized_at) 
-      << CXXDefaultConstructor << Context.getTagDeclType(ClassDecl);
-    Constructor->setInvalidDecl();
-    return;
-  }
 
   // The exception specification is needed because we are defining the
   // function.
   ResolveExceptionSpec(CurrentLocation,
                        Constructor->getType()->castAs<FunctionProtoType>());
+  MarkVTableUsed(CurrentLocation, ClassDecl);
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
+
+  if (SetCtorInitializers(Constructor, /*AnyErrors=*/false)) {
+    Constructor->setInvalidDecl();
+    return;
+  }
 
   SourceLocation Loc = Constructor->getLocEnd().isValid()
                            ? Constructor->getLocEnd()
                            : Constructor->getLocation();
   Constructor->setBody(new (Context) CompoundStmt(Loc));
-
   Constructor->markUsed(Context);
-  MarkVTableUsed(CurrentLocation, ClassDecl);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(Constructor);
@@ -10484,8 +10552,21 @@ void Sema::DefineInheritingConstructor(SourceLocation CurrentLocation,
   assert(Constructor->getInheritedConstructor() &&
          !Constructor->doesThisDeclarationHaveABody() &&
          !Constructor->isDeleted());
-  if (Constructor->isInvalidDecl())
+  if (Constructor->willHaveBody() || Constructor->isInvalidDecl())
     return;
+
+  // Initializations are performed "as if by a defaulted default constructor",
+  // so enter the appropriate scope.
+  SynthesizedFunctionScope Scope(*this, Constructor);
+
+  // The exception specification is needed because we are defining the
+  // function.
+  ResolveExceptionSpec(CurrentLocation,
+                       Constructor->getType()->castAs<FunctionProtoType>());
+  MarkVTableUsed(CurrentLocation, ClassDecl);
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
 
   ConstructorUsingShadowDecl *Shadow =
       Constructor->getInheritedConstructor().getShadowDecl();
@@ -10500,11 +10581,6 @@ void Sema::DefineInheritingConstructor(SourceLocation CurrentLocation,
   InheritedConstructorInfo ICI(*this, CurrentLocation, Shadow);
   CXXRecordDecl *RD = Shadow->getParent();
   SourceLocation InitLoc = Shadow->getLocation();
-
-  // Initializations are performed "as if by a defaulted default constructor",
-  // so enter the appropriate scope.
-  SynthesizedFunctionScope Scope(*this, Constructor);
-  DiagnosticErrorTrap Trap(Diags);
 
   // Build explicit initializers for all base classes from which the
   // constructor was inherited.
@@ -10536,22 +10612,13 @@ void Sema::DefineInheritingConstructor(SourceLocation CurrentLocation,
   // We now proceed as if for a defaulted default constructor, with the relevant
   // initializers replaced.
 
-  bool HadError = SetCtorInitializers(Constructor, /*AnyErrors*/false, Inits);
-  if (HadError || Trap.hasErrorOccurred()) {
-    Diag(CurrentLocation, diag::note_inhctor_synthesized_at) << RD;
+  if (SetCtorInitializers(Constructor, /*AnyErrors*/false, Inits)) {
     Constructor->setInvalidDecl();
     return;
   }
 
-  // The exception specification is needed because we are defining the
-  // function.
-  ResolveExceptionSpec(CurrentLocation,
-                       Constructor->getType()->castAs<FunctionProtoType>());
-
   Constructor->setBody(new (Context) CompoundStmt(InitLoc));
-
   Constructor->markUsed(Context);
-  MarkVTableUsed(CurrentLocation, ClassDecl);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(Constructor);
@@ -10627,37 +10694,36 @@ void Sema::DefineImplicitDestructor(SourceLocation CurrentLocation,
           !Destructor->doesThisDeclarationHaveABody() &&
           !Destructor->isDeleted()) &&
          "DefineImplicitDestructor - call it for implicit default dtor");
+  if (Destructor->willHaveBody() || Destructor->isInvalidDecl())
+    return;
+
   CXXRecordDecl *ClassDecl = Destructor->getParent();
   assert(ClassDecl && "DefineImplicitDestructor - invalid destructor");
 
-  if (Destructor->isInvalidDecl())
-    return;
-
   SynthesizedFunctionScope Scope(*this, Destructor);
-
-  DiagnosticErrorTrap Trap(Diags);
-  MarkBaseAndMemberDestructorsReferenced(Destructor->getLocation(),
-                                         Destructor->getParent());
-
-  if (CheckDestructor(Destructor) || Trap.hasErrorOccurred()) {
-    Diag(CurrentLocation, diag::note_member_synthesized_at) 
-      << CXXDestructor << Context.getTagDeclType(ClassDecl);
-
-    Destructor->setInvalidDecl();
-    return;
-  }
 
   // The exception specification is needed because we are defining the
   // function.
   ResolveExceptionSpec(CurrentLocation,
                        Destructor->getType()->castAs<FunctionProtoType>());
+  MarkVTableUsed(CurrentLocation, ClassDecl);
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
+
+  MarkBaseAndMemberDestructorsReferenced(Destructor->getLocation(),
+                                         Destructor->getParent());
+
+  if (CheckDestructor(Destructor)) {
+    Destructor->setInvalidDecl();
+    return;
+  }
 
   SourceLocation Loc = Destructor->getLocEnd().isValid()
                            ? Destructor->getLocEnd()
                            : Destructor->getLocation();
   Destructor->setBody(new (Context) CompoundStmt(Loc));
   Destructor->markUsed(Context);
-  MarkVTableUsed(CurrentLocation, ClassDecl);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(Destructor);
@@ -11111,7 +11177,7 @@ buildSingleCopyAssignRecursively(Sema &S, SourceLocation Loc, QualType T,
     = new (S.Context) BinaryOperator(IterationVarRefRVal.build(S, Loc),
                      IntegerLiteral::Create(S.Context, Upper, SizeType, Loc),
                                      BO_NE, S.Context.BoolTy,
-                                     VK_RValue, OK_Ordinary, Loc, false);
+                                     VK_RValue, OK_Ordinary, Loc, FPOptions());
 
   // Create the pre-increment of the iteration variable.
   Expr *Increment
@@ -11225,8 +11291,7 @@ CXXMethodDecl *Sema::DeclareImplicitCopyAssignment(CXXRecordDecl *ClassDecl) {
 /// Diagnose an implicit copy operation for a class which is odr-used, but
 /// which is deprecated because the class has a user-declared copy constructor,
 /// copy assignment operator, or destructor.
-static void diagnoseDeprecatedCopyOperation(Sema &S, CXXMethodDecl *CopyOp,
-                                            SourceLocation UseLoc) {
+static void diagnoseDeprecatedCopyOperation(Sema &S, CXXMethodDecl *CopyOp) {
   assert(CopyOp->isImplicit());
 
   CXXRecordDecl *RD = CopyOp->getParent();
@@ -11265,10 +11330,6 @@ static void diagnoseDeprecatedCopyOperation(Sema &S, CXXMethodDecl *CopyOp,
          diag::warn_deprecated_copy_operation)
       << RD << /*copy assignment*/!isa<CXXConstructorDecl>(CopyOp)
       << /*destructor*/isa<CXXDestructorDecl>(UserDeclaredOperation);
-    S.Diag(UseLoc, diag::note_member_synthesized_at)
-      << (isa<CXXConstructorDecl>(CopyOp) ? Sema::CXXCopyConstructor
-                                          : Sema::CXXCopyAssignment)
-      << RD;
   }
 }
 
@@ -11280,25 +11341,31 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
           !CopyAssignOperator->doesThisDeclarationHaveABody() &&
           !CopyAssignOperator->isDeleted()) &&
          "DefineImplicitCopyAssignment called for wrong function");
+  if (CopyAssignOperator->willHaveBody() || CopyAssignOperator->isInvalidDecl())
+    return;
 
   CXXRecordDecl *ClassDecl = CopyAssignOperator->getParent();
-
-  if (ClassDecl->isInvalidDecl() || CopyAssignOperator->isInvalidDecl()) {
+  if (ClassDecl->isInvalidDecl()) {
     CopyAssignOperator->setInvalidDecl();
     return;
   }
+
+  SynthesizedFunctionScope Scope(*this, CopyAssignOperator);
+
+  // The exception specification is needed because we are defining the
+  // function.
+  ResolveExceptionSpec(CurrentLocation,
+                       CopyAssignOperator->getType()->castAs<FunctionProtoType>());
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
 
   // C++11 [class.copy]p18:
   //   The [definition of an implicitly declared copy assignment operator] is
   //   deprecated if the class has a user-declared copy constructor or a
   //   user-declared destructor.
   if (getLangOpts().CPlusPlus11 && CopyAssignOperator->isImplicit())
-    diagnoseDeprecatedCopyOperation(*this, CopyAssignOperator, CurrentLocation);
-
-  CopyAssignOperator->markUsed(Context);
-
-  SynthesizedFunctionScope Scope(*this, CopyAssignOperator);
-  DiagnosticErrorTrap Trap(Diags);
+    diagnoseDeprecatedCopyOperation(*this, CopyAssignOperator);
 
   // C++0x [class.copy]p30:
   //   The implicitly-defined or explicitly-defaulted copy assignment operator
@@ -11364,8 +11431,6 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
                                             /*CopyingBaseSubobject=*/true,
                                             /*Copying=*/true);
     if (Copy.isInvalid()) {
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXCopyAssignment << Context.getTagDeclType(ClassDecl);
       CopyAssignOperator->setInvalidDecl();
       return;
     }
@@ -11391,8 +11456,6 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
       Diag(ClassDecl->getLocation(), diag::err_uninitialized_member_for_assign)
         << Context.getTagDeclType(ClassDecl) << 0 << Field->getDeclName();
       Diag(Field->getLocation(), diag::note_declared_at);
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXCopyAssignment << Context.getTagDeclType(ClassDecl);
       Invalid = true;
       continue;
     }
@@ -11403,8 +11466,6 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
       Diag(ClassDecl->getLocation(), diag::err_uninitialized_member_for_assign)
         << Context.getTagDeclType(ClassDecl) << 1 << Field->getDeclName();
       Diag(Field->getLocation(), diag::note_declared_at);
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXCopyAssignment << Context.getTagDeclType(ClassDecl);
       Invalid = true;      
       continue;
     }
@@ -11437,8 +11498,6 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
                                             /*CopyingBaseSubobject=*/false,
                                             /*Copying=*/true);
     if (Copy.isInvalid()) {
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXCopyAssignment << Context.getTagDeclType(ClassDecl);
       CopyAssignOperator->setInvalidDecl();
       return;
     }
@@ -11454,21 +11513,9 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
     StmtResult Return = BuildReturnStmt(Loc, ThisObj.get());
     if (Return.isInvalid())
       Invalid = true;
-    else {
+    else
       Statements.push_back(Return.getAs<Stmt>());
-
-      if (Trap.hasErrorOccurred()) {
-        Diag(CurrentLocation, diag::note_member_synthesized_at) 
-          << CXXCopyAssignment << Context.getTagDeclType(ClassDecl);
-        Invalid = true;
-      }
-    }
   }
-
-  // The exception specification is needed because we are defining the
-  // function.
-  ResolveExceptionSpec(CurrentLocation,
-                       CopyAssignOperator->getType()->castAs<FunctionProtoType>());
 
   if (Invalid) {
     CopyAssignOperator->setInvalidDecl();
@@ -11483,6 +11530,7 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
     assert(!Body.isInvalid() && "Compound statement creation cannot fail");
   }
   CopyAssignOperator->setBody(Body.getAs<Stmt>());
+  CopyAssignOperator->markUsed(Context);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(CopyAssignOperator);
@@ -11655,19 +11703,15 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
           !MoveAssignOperator->doesThisDeclarationHaveABody() &&
           !MoveAssignOperator->isDeleted()) &&
          "DefineImplicitMoveAssignment called for wrong function");
+  if (MoveAssignOperator->willHaveBody() || MoveAssignOperator->isInvalidDecl())
+    return;
 
   CXXRecordDecl *ClassDecl = MoveAssignOperator->getParent();
-
-  if (ClassDecl->isInvalidDecl() || MoveAssignOperator->isInvalidDecl()) {
+  if (ClassDecl->isInvalidDecl()) {
     MoveAssignOperator->setInvalidDecl();
     return;
   }
   
-  MoveAssignOperator->markUsed(Context);
-
-  SynthesizedFunctionScope Scope(*this, MoveAssignOperator);
-  DiagnosticErrorTrap Trap(Diags);
-
   // C++0x [class.copy]p28:
   //   The implicitly-defined or move assignment operator for a non-union class
   //   X performs memberwise move assignment of its subobjects. The direct base
@@ -11679,6 +11723,16 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
   // Issue a warning if our implicit move assignment operator will move
   // from a virtual base more than once.
   checkMoveAssignmentForRepeatedMove(*this, ClassDecl, CurrentLocation);
+
+  SynthesizedFunctionScope Scope(*this, MoveAssignOperator);
+
+  // The exception specification is needed because we are defining the
+  // function.
+  ResolveExceptionSpec(CurrentLocation,
+                       MoveAssignOperator->getType()->castAs<FunctionProtoType>());
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
 
   // The statements that form the synthesized function body.
   SmallVector<Stmt*, 8> Statements;
@@ -11744,8 +11798,6 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
                                             /*CopyingBaseSubobject=*/true,
                                             /*Copying=*/false);
     if (Move.isInvalid()) {
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXMoveAssignment << Context.getTagDeclType(ClassDecl);
       MoveAssignOperator->setInvalidDecl();
       return;
     }
@@ -11771,8 +11823,6 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
       Diag(ClassDecl->getLocation(), diag::err_uninitialized_member_for_assign)
         << Context.getTagDeclType(ClassDecl) << 0 << Field->getDeclName();
       Diag(Field->getLocation(), diag::note_declared_at);
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXMoveAssignment << Context.getTagDeclType(ClassDecl);
       Invalid = true;
       continue;
     }
@@ -11783,8 +11833,6 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
       Diag(ClassDecl->getLocation(), diag::err_uninitialized_member_for_assign)
         << Context.getTagDeclType(ClassDecl) << 1 << Field->getDeclName();
       Diag(Field->getLocation(), diag::note_declared_at);
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXMoveAssignment << Context.getTagDeclType(ClassDecl);
       Invalid = true;      
       continue;
     }
@@ -11820,8 +11868,6 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
                                             /*CopyingBaseSubobject=*/false,
                                             /*Copying=*/false);
     if (Move.isInvalid()) {
-      Diag(CurrentLocation, diag::note_member_synthesized_at) 
-        << CXXMoveAssignment << Context.getTagDeclType(ClassDecl);
       MoveAssignOperator->setInvalidDecl();
       return;
     }
@@ -11838,21 +11884,9 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
     StmtResult Return = BuildReturnStmt(Loc, ThisObj.get());
     if (Return.isInvalid())
       Invalid = true;
-    else {
+    else
       Statements.push_back(Return.getAs<Stmt>());
-
-      if (Trap.hasErrorOccurred()) {
-        Diag(CurrentLocation, diag::note_member_synthesized_at) 
-          << CXXMoveAssignment << Context.getTagDeclType(ClassDecl);
-        Invalid = true;
-      }
-    }
   }
-
-  // The exception specification is needed because we are defining the
-  // function.
-  ResolveExceptionSpec(CurrentLocation,
-                       MoveAssignOperator->getType()->castAs<FunctionProtoType>());
 
   if (Invalid) {
     MoveAssignOperator->setInvalidDecl();
@@ -11867,6 +11901,7 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
     assert(!Body.isInvalid() && "Compound statement creation cannot fail");
   }
   MoveAssignOperator->setBody(Body.getAs<Stmt>());
+  MoveAssignOperator->markUsed(Context);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(MoveAssignOperator);
@@ -11942,8 +11977,10 @@ CXXConstructorDecl *Sema::DeclareImplicitCopyConstructor(
   Scope *S = getScopeForContext(ClassDecl);
   CheckImplicitSpecialMemberDeclaration(S, CopyConstructor);
 
-  if (ShouldDeleteSpecialMember(CopyConstructor, CXXCopyConstructor))
+  if (ShouldDeleteSpecialMember(CopyConstructor, CXXCopyConstructor)) {
+    ClassDecl->setImplicitCopyConstructorIsDeleted();
     SetDeclDeleted(CopyConstructor, ClassLoc);
+  }
 
   if (S)
     PushOnScopeChains(CopyConstructor, S, false);
@@ -11953,30 +11990,37 @@ CXXConstructorDecl *Sema::DeclareImplicitCopyConstructor(
 }
 
 void Sema::DefineImplicitCopyConstructor(SourceLocation CurrentLocation,
-                                   CXXConstructorDecl *CopyConstructor) {
+                                         CXXConstructorDecl *CopyConstructor) {
   assert((CopyConstructor->isDefaulted() &&
           CopyConstructor->isCopyConstructor() &&
           !CopyConstructor->doesThisDeclarationHaveABody() &&
           !CopyConstructor->isDeleted()) &&
          "DefineImplicitCopyConstructor - call it for implicit copy ctor");
+  if (CopyConstructor->willHaveBody() || CopyConstructor->isInvalidDecl())
+    return;
 
   CXXRecordDecl *ClassDecl = CopyConstructor->getParent();
   assert(ClassDecl && "DefineImplicitCopyConstructor - invalid constructor");
+
+  SynthesizedFunctionScope Scope(*this, CopyConstructor);
+
+  // The exception specification is needed because we are defining the
+  // function.
+  ResolveExceptionSpec(CurrentLocation,
+                       CopyConstructor->getType()->castAs<FunctionProtoType>());
+  MarkVTableUsed(CurrentLocation, ClassDecl);
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
 
   // C++11 [class.copy]p7:
   //   The [definition of an implicitly declared copy constructor] is
   //   deprecated if the class has a user-declared copy assignment operator
   //   or a user-declared destructor.
   if (getLangOpts().CPlusPlus11 && CopyConstructor->isImplicit())
-    diagnoseDeprecatedCopyOperation(*this, CopyConstructor, CurrentLocation);
+    diagnoseDeprecatedCopyOperation(*this, CopyConstructor);
 
-  SynthesizedFunctionScope Scope(*this, CopyConstructor);
-  DiagnosticErrorTrap Trap(Diags);
-
-  if (SetCtorInitializers(CopyConstructor, /*AnyErrors=*/false) ||
-      Trap.hasErrorOccurred()) {
-    Diag(CurrentLocation, diag::note_member_synthesized_at) 
-      << CXXCopyConstructor << Context.getTagDeclType(ClassDecl);
+  if (SetCtorInitializers(CopyConstructor, /*AnyErrors=*/false)) {
     CopyConstructor->setInvalidDecl();
   }  else {
     SourceLocation Loc = CopyConstructor->getLocEnd().isValid()
@@ -11985,15 +12029,8 @@ void Sema::DefineImplicitCopyConstructor(SourceLocation CurrentLocation,
     Sema::CompoundScopeRAII CompoundScope(*this);
     CopyConstructor->setBody(
         ActOnCompoundStmt(Loc, Loc, None, /*isStmtExpr=*/false).getAs<Stmt>());
+    CopyConstructor->markUsed(Context);
   }
-
-  // The exception specification is needed because we are defining the
-  // function.
-  ResolveExceptionSpec(CurrentLocation,
-                       CopyConstructor->getType()->castAs<FunctionProtoType>());
-
-  CopyConstructor->markUsed(Context);
-  MarkVTableUsed(CurrentLocation, ClassDecl);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(CopyConstructor);
@@ -12076,40 +12113,40 @@ CXXConstructorDecl *Sema::DeclareImplicitMoveConstructor(
 }
 
 void Sema::DefineImplicitMoveConstructor(SourceLocation CurrentLocation,
-                                   CXXConstructorDecl *MoveConstructor) {
+                                         CXXConstructorDecl *MoveConstructor) {
   assert((MoveConstructor->isDefaulted() &&
           MoveConstructor->isMoveConstructor() &&
           !MoveConstructor->doesThisDeclarationHaveABody() &&
           !MoveConstructor->isDeleted()) &&
          "DefineImplicitMoveConstructor - call it for implicit move ctor");
+  if (MoveConstructor->willHaveBody() || MoveConstructor->isInvalidDecl())
+    return;
 
   CXXRecordDecl *ClassDecl = MoveConstructor->getParent();
   assert(ClassDecl && "DefineImplicitMoveConstructor - invalid constructor");
 
   SynthesizedFunctionScope Scope(*this, MoveConstructor);
-  DiagnosticErrorTrap Trap(Diags);
 
-  if (SetCtorInitializers(MoveConstructor, /*AnyErrors=*/false) ||
-      Trap.hasErrorOccurred()) {
-    Diag(CurrentLocation, diag::note_member_synthesized_at) 
-      << CXXMoveConstructor << Context.getTagDeclType(ClassDecl);
+  // The exception specification is needed because we are defining the
+  // function.
+  ResolveExceptionSpec(CurrentLocation,
+                       MoveConstructor->getType()->castAs<FunctionProtoType>());
+  MarkVTableUsed(CurrentLocation, ClassDecl);
+
+  // Add a context note for diagnostics produced after this point.
+  Scope.addContextNote(CurrentLocation);
+
+  if (SetCtorInitializers(MoveConstructor, /*AnyErrors=*/false)) {
     MoveConstructor->setInvalidDecl();
-  }  else {
+  } else {
     SourceLocation Loc = MoveConstructor->getLocEnd().isValid()
                              ? MoveConstructor->getLocEnd()
                              : MoveConstructor->getLocation();
     Sema::CompoundScopeRAII CompoundScope(*this);
     MoveConstructor->setBody(ActOnCompoundStmt(
         Loc, Loc, None, /*isStmtExpr=*/ false).getAs<Stmt>());
+    MoveConstructor->markUsed(Context);
   }
-
-  // The exception specification is needed because we are defining the
-  // function.
-  ResolveExceptionSpec(CurrentLocation,
-                       MoveConstructor->getType()->castAs<FunctionProtoType>());
-
-  MoveConstructor->markUsed(Context);
-  MarkVTableUsed(CurrentLocation, ClassDecl);
 
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(MoveConstructor);
@@ -12123,6 +12160,8 @@ bool Sema::isImplicitlyDeleted(FunctionDecl *FD) {
 void Sema::DefineImplicitLambdaToFunctionPointerConversion(
                             SourceLocation CurrentLocation,
                             CXXConversionDecl *Conv) {
+  SynthesizedFunctionScope Scope(*this, Conv);
+   
   CXXRecordDecl *Lambda = Conv->getParent();
   CXXMethodDecl *CallOp = Lambda->getLambdaCallOperator();
   // If we are defining a specialization of a conversion to function-ptr
@@ -12145,6 +12184,7 @@ void Sema::DefineImplicitLambdaToFunctionPointerConversion(
           "Conversion operator must have a corresponding call operator");
     CallOp = cast<CXXMethodDecl>(CallOpSpec);
   }
+
   // Mark the call operator referenced (and add to pending instantiations
   // if necessary).
   // For both the conversion and static-invoker template specializations
@@ -12152,9 +12192,6 @@ void Sema::DefineImplicitLambdaToFunctionPointerConversion(
   // to the PendingInstantiations.
   MarkFunctionReferenced(CurrentLocation, CallOp);
 
-  SynthesizedFunctionScope Scope(*this, Conv);
-  DiagnosticErrorTrap Trap(Diags);
-   
   // Retrieve the static invoker...
   CXXMethodDecl *Invoker = Lambda->getLambdaStaticInvoker();
   // ... and get the corresponding specialization for a generic lambda.
@@ -12192,7 +12229,7 @@ void Sema::DefineImplicitLambdaToFunctionPointerConversion(
   if (ASTMutationListener *L = getASTMutationListener()) {
     L->CompletedImplicitDefinition(Conv);
     L->CompletedImplicitDefinition(Invoker);
-   }
+  }
 }
 
 
@@ -12203,10 +12240,7 @@ void Sema::DefineImplicitLambdaToBlockPointerConversion(
 {
   assert(!Conv->getParent()->isGenericLambda());
 
-  Conv->markUsed(Context);
-  
   SynthesizedFunctionScope Scope(*this, Conv);
-  DiagnosticErrorTrap Trap(Diags);
   
   // Copy-initialize the lambda object as needed to capture it.
   Expr *This = ActOnCXXThis(CurrentLocation).get();
@@ -12243,8 +12277,9 @@ void Sema::DefineImplicitLambdaToBlockPointerConversion(
   // Set the body of the conversion function.
   Stmt *ReturnS = Return.get();
   Conv->setBody(new (Context) CompoundStmt(Context, ReturnS,
-                                           Conv->getLocation(), 
+                                           Conv->getLocation(),
                                            Conv->getLocation()));
+  Conv->markUsed(Context);
   
   // We're done; notify the mutation listener, if any.
   if (ASTMutationListener *L = getASTMutationListener()) {
@@ -13121,7 +13156,8 @@ VarDecl *Sema::BuildExceptionDeclaration(Scope *S,
   if (!Invalid && !ExDeclType->isDependentType()) {
     if (const RecordType *recordType = ExDeclType->getAs<RecordType>()) {
       // Insulate this from anything else we might currently be parsing.
-      EnterExpressionEvaluationContext scope(*this, PotentiallyEvaluated);
+      EnterExpressionEvaluationContext scope(
+          *this, ExpressionEvaluationContext::PotentiallyEvaluated);
 
       // C++ [except.handle]p16:
       //   The object declared in an exception-declaration or, if the
@@ -13266,6 +13302,14 @@ Decl *Sema::BuildStaticAssertDeclaration(SourceLocation StaticAssertLoc,
     }
   }
 
+  ExprResult FullAssertExpr = ActOnFinishFullExpr(AssertExpr, StaticAssertLoc,
+                                                  /*DiscardedValue*/false,
+                                                  /*IsConstexpr*/true);
+  if (FullAssertExpr.isInvalid())
+    Failed = true;
+  else
+    AssertExpr = FullAssertExpr.get();
+
   Decl *Decl = StaticAssertDecl::Create(Context, CurContext, StaticAssertLoc,
                                         AssertExpr, AssertMessage, RParenLoc,
                                         Failed);
@@ -13409,7 +13453,8 @@ Decl *Sema::ActOnTemplatedFriendTag(Scope *S, SourceLocation FriendLoc,
                       /*ScopedEnumKWLoc=*/SourceLocation(),
                       /*ScopedEnumUsesClassTag=*/false,
                       /*UnderlyingType=*/TypeResult(),
-                      /*IsTypeSpecifier=*/false);
+                      /*IsTypeSpecifier=*/false,
+                      /*IsTemplateParamOrArg=*/false);
     }
 
     NestedNameSpecifierLoc QualifierLoc = SS.getWithLocInContext(Context);
@@ -13893,6 +13938,9 @@ void Sema::SetDeclDeleted(Decl *Dcl, SourceLocation DelLoc) {
     return;
   }
 
+  // Deleted function does not have a body.
+  Fn->setWillHaveBody(false);
+
   if (const FunctionDecl *Prev = Fn->getPreviousDecl()) {
     // Don't consider the implicit declaration we generate for explicit
     // specializations. FIXME: Do not generate these implicit declarations.
@@ -13970,6 +14018,11 @@ void Sema::SetDeclDefaulted(Decl *Dcl, SourceLocation DefaultLoc) {
 
     MD->setDefaulted();
     MD->setExplicitlyDefaulted();
+
+    // Unset that we will have a body for this function. We might not,
+    // if it turns out to be trivial, and we don't need this marking now
+    // that we've marked it as defaulted.
+    MD->setWillHaveBody(false);
 
     // If this definition appears within the record, do the checking when
     // the record is complete.
@@ -14205,7 +14258,8 @@ void Sema::ActOnCXXEnterDeclInitializer(Scope *S, Decl *D) {
   // new expression evaluation context that is associated with this static
   // data member.
   if (isStaticDataMember(D))
-    PushExpressionEvaluationContext(PotentiallyEvaluated, D);
+    PushExpressionEvaluationContext(
+        ExpressionEvaluationContext::PotentiallyEvaluated, D);
 }
 
 /// ActOnCXXExitDeclInitializer - Invoked after we are finished parsing an
@@ -14667,6 +14721,7 @@ bool Sema::checkThisInStaticMemberFunctionExceptionSpec(CXXMethodDecl *Method) {
   case EST_ComputedNoexcept:
     if (!Finder.TraverseStmt(Proto->getNoexceptExpr()))
       return true;
+    LLVM_FALLTHROUGH;
     
   case EST_Dynamic:
     for (const auto &E : Proto->exceptions()) {

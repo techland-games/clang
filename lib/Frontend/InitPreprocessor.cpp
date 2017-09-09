@@ -14,6 +14,7 @@
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/MacroBuilder.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/SyncScope.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/FrontendDiagnostic.h"
@@ -374,9 +375,14 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
     else if (!LangOpts.GNUMode && LangOpts.Digraphs)
       Builder.defineMacro("__STDC_VERSION__", "199409L");
   } else {
-    // FIXME: Use correct value for C++17.
-    if (LangOpts.CPlusPlus1z)
-      Builder.defineMacro("__cplusplus", "201406L");
+    // FIXME: Use correct value for C++20.
+    if (LangOpts.CPlusPlus2a)
+      Builder.defineMacro("__cplusplus", "201707L");
+    // C++17 [cpp.predefined]p1:
+    //   The name __cplusplus is defined to the value 201703L when compiling a
+    //   C++ translation unit.
+    else if (LangOpts.CPlusPlus1z)
+      Builder.defineMacro("__cplusplus", "201703L");
     // C++1y [cpp.predefined]p1:
     //   The name __cplusplus is defined to the value 201402L when compiling a
     //   C++ translation unit.
@@ -492,6 +498,8 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
     Builder.defineMacro("__cpp_ref_qualifiers", "200710");
     Builder.defineMacro("__cpp_alias_templates", "200704");
   }
+  if (LangOpts.ThreadsafeStatics)
+    Builder.defineMacro("__cpp_threadsafe_static_init", "200806");
 
   // C++14 features.
   if (LangOpts.CPlusPlus14) {
@@ -514,6 +522,7 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
     Builder.defineMacro("__cpp_noexcept_function_type", "201510");
     Builder.defineMacro("__cpp_capture_star_this", "201603");
     Builder.defineMacro("__cpp_if_constexpr", "201606");
+    Builder.defineMacro("__cpp_deduction_guides", "201611");
     Builder.defineMacro("__cpp_template_auto", "201606");
     Builder.defineMacro("__cpp_namespace_attributes", "201411");
     Builder.defineMacro("__cpp_enumerator_attributes", "201411");
@@ -523,8 +532,6 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
     Builder.defineMacro("__cpp_structured_bindings", "201606");
     Builder.defineMacro("__cpp_nontype_template_args", "201411");
     Builder.defineMacro("__cpp_fold_expressions", "201603");
-    // FIXME: This is not yet listed in SD-6.
-    Builder.defineMacro("__cpp_deduction_guides", "201611");
   }
   if (LangOpts.AlignedAllocation)
     Builder.defineMacro("__cpp_aligned_new", "201606");
@@ -533,7 +540,7 @@ static void InitializeCPlusPlusFeatureTestMacros(const LangOptions &LangOpts,
   if (LangOpts.ConceptsTS)
     Builder.defineMacro("__cpp_experimental_concepts", "1");
   if (LangOpts.CoroutinesTS)
-    Builder.defineMacro("__cpp_coroutines", "1");
+    Builder.defineMacro("__cpp_coroutines", "201703L");
 }
 
 static void InitializePredefinedMacros(const TargetInfo &TI,
@@ -569,6 +576,20 @@ static void InitializePredefinedMacros(const TargetInfo &TI,
   Builder.defineMacro("__ATOMIC_RELEASE", "3");
   Builder.defineMacro("__ATOMIC_ACQ_REL", "4");
   Builder.defineMacro("__ATOMIC_SEQ_CST", "5");
+
+  // Define macros for the OpenCL memory scope.
+  // The values should match AtomicScopeOpenCLModel::ID enum.
+  static_assert(
+      static_cast<unsigned>(AtomicScopeOpenCLModel::WorkGroup) == 1 &&
+          static_cast<unsigned>(AtomicScopeOpenCLModel::Device) == 2 &&
+          static_cast<unsigned>(AtomicScopeOpenCLModel::AllSVMDevices) == 3 &&
+          static_cast<unsigned>(AtomicScopeOpenCLModel::SubGroup) == 4,
+      "Invalid OpenCL memory scope enum definition");
+  Builder.defineMacro("__OPENCL_MEMORY_SCOPE_WORK_ITEM", "0");
+  Builder.defineMacro("__OPENCL_MEMORY_SCOPE_WORK_GROUP", "1");
+  Builder.defineMacro("__OPENCL_MEMORY_SCOPE_DEVICE", "2");
+  Builder.defineMacro("__OPENCL_MEMORY_SCOPE_ALL_SVM_DEVICES", "3");
+  Builder.defineMacro("__OPENCL_MEMORY_SCOPE_SUB_GROUP", "4");
 
   // Support for #pragma redefine_extname (Sun compatibility)
   Builder.defineMacro("__PRAGMA_REDEFINE_EXTNAME", "1");
@@ -880,14 +901,16 @@ static void InitializePredefinedMacros(const TargetInfo &TI,
     // The value written by __atomic_test_and_set.
     // FIXME: This is target-dependent.
     Builder.defineMacro("__GCC_ATOMIC_TEST_AND_SET_TRUEVAL", "1");
+  }
 
+  auto addLockFreeMacros = [&](const llvm::Twine &Prefix) {
     // Used by libc++ and libstdc++ to implement ATOMIC_<foo>_LOCK_FREE.
     unsigned InlineWidthBits = TI.getMaxAtomicInlineWidth();
-#define DEFINE_LOCK_FREE_MACRO(TYPE, Type) \
-    Builder.defineMacro("__GCC_ATOMIC_" #TYPE "_LOCK_FREE", \
-                        getLockFreeValue(TI.get##Type##Width(), \
-                                         TI.get##Type##Align(), \
-                                         InlineWidthBits));
+#define DEFINE_LOCK_FREE_MACRO(TYPE, Type)                                     \
+  Builder.defineMacro(Prefix + #TYPE "_LOCK_FREE",                             \
+                      getLockFreeValue(TI.get##Type##Width(),                  \
+                                       TI.get##Type##Align(),                  \
+                                       InlineWidthBits));
     DEFINE_LOCK_FREE_MACRO(BOOL, Bool);
     DEFINE_LOCK_FREE_MACRO(CHAR, Char);
     DEFINE_LOCK_FREE_MACRO(CHAR16_T, Char16);
@@ -897,12 +920,15 @@ static void InitializePredefinedMacros(const TargetInfo &TI,
     DEFINE_LOCK_FREE_MACRO(INT, Int);
     DEFINE_LOCK_FREE_MACRO(LONG, Long);
     DEFINE_LOCK_FREE_MACRO(LLONG, LongLong);
-    Builder.defineMacro("__GCC_ATOMIC_POINTER_LOCK_FREE",
+    Builder.defineMacro(Prefix + "POINTER_LOCK_FREE",
                         getLockFreeValue(TI.getPointerWidth(0),
                                          TI.getPointerAlign(0),
                                          InlineWidthBits));
 #undef DEFINE_LOCK_FREE_MACRO
-  }
+  };
+  addLockFreeMacros("__CLANG_ATOMIC_");
+  if (!LangOpts.MSVCCompat)
+    addLockFreeMacros("__GCC_ATOMIC_");
 
   if (LangOpts.NoInlineDefine)
     Builder.defineMacro("__NO_INLINE__");
@@ -1034,7 +1060,9 @@ void clang::InitializePreprocessor(
 
   // Install things like __POWERPC__, __GNUC__, etc into the macro table.
   if (InitOpts.UsePredefines) {
-    if (LangOpts.CUDA && PP.getAuxTargetInfo())
+    // FIXME: This will create multiple definitions for most of the predefined
+    // macros. This is not the right way to handle this.
+    if ((LangOpts.CUDA || LangOpts.OpenMPIsDevice) && PP.getAuxTargetInfo())
       InitializePredefinedMacros(*PP.getAuxTargetInfo(), LangOpts, FEOpts,
                                  Builder);
 

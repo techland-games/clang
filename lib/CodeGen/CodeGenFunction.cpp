@@ -22,6 +22,7 @@
 #include "CodeGenPGO.h"
 #include "TargetInfo.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/ASTLambda.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/StmtCXX.h"
@@ -45,14 +46,14 @@ static bool shouldEmitLifetimeMarkers(const CodeGenOptions &CGOpts,
   if (CGOpts.DisableLifetimeMarkers)
     return false;
 
-  // Asan uses markers for use-after-scope checks.
-  if (CGOpts.SanitizeAddressUseAfterScope)
-    return true;
-
   // Disable lifetime markers in msan builds.
   // FIXME: Remove this when msan works with lifetime markers.
   if (LangOpts.Sanitize.has(SanitizerKind::Memory))
     return false;
+
+  // Asan uses markers for use-after-scope checks.
+  if (CGOpts.SanitizeAddressUseAfterScope)
+    return true;
 
   // For now, only in optimized builds.
   return CGOpts.OptimizationLevel != 0;
@@ -117,25 +118,27 @@ CodeGenFunction::~CodeGenFunction() {
 }
 
 CharUnits CodeGenFunction::getNaturalPointeeTypeAlignment(QualType T,
-                                                     AlignmentSource *Source) {
-  return getNaturalTypeAlignment(T->getPointeeType(), Source,
+                                                    LValueBaseInfo *BaseInfo) {
+  return getNaturalTypeAlignment(T->getPointeeType(), BaseInfo,
                                  /*forPointee*/ true);
 }
 
 CharUnits CodeGenFunction::getNaturalTypeAlignment(QualType T,
-                                                   AlignmentSource *Source,
+                                                   LValueBaseInfo *BaseInfo,
                                                    bool forPointeeType) {
   // Honor alignment typedef attributes even on incomplete types.
   // We also honor them straight for C++ class types, even as pointees;
   // there's an expressivity gap here.
   if (auto TT = T->getAs<TypedefType>()) {
     if (auto Align = TT->getDecl()->getMaxAlignment()) {
-      if (Source) *Source = AlignmentSource::AttributedType;
+      if (BaseInfo)
+        *BaseInfo = LValueBaseInfo(AlignmentSource::AttributedType, false);
       return getContext().toCharUnitsFromBits(Align);
     }
   }
 
-  if (Source) *Source = AlignmentSource::Type;
+  if (BaseInfo)
+    *BaseInfo = LValueBaseInfo(AlignmentSource::Type, false);
 
   CharUnits Alignment;
   if (T->isIncompleteType()) {
@@ -165,9 +168,9 @@ CharUnits CodeGenFunction::getNaturalTypeAlignment(QualType T,
 }
 
 LValue CodeGenFunction::MakeNaturalAlignAddrLValue(llvm::Value *V, QualType T) {
-  AlignmentSource AlignSource;
-  CharUnits Alignment = getNaturalTypeAlignment(T, &AlignSource);
-  return LValue::MakeAddr(Address(V, Alignment), T, getContext(), AlignSource,
+  LValueBaseInfo BaseInfo;
+  CharUnits Alignment = getNaturalTypeAlignment(T, &BaseInfo);
+  return LValue::MakeAddr(Address(V, Alignment), T, getContext(), BaseInfo,
                           CGM.getTBAAInfo(T));
 }
 
@@ -175,9 +178,9 @@ LValue CodeGenFunction::MakeNaturalAlignAddrLValue(llvm::Value *V, QualType T) {
 /// construct an l-value with the natural pointee alignment of T.
 LValue
 CodeGenFunction::MakeNaturalAlignPointeeAddrLValue(llvm::Value *V, QualType T) {
-  AlignmentSource AlignSource;
-  CharUnits Align = getNaturalTypeAlignment(T, &AlignSource, /*pointee*/ true);
-  return MakeAddrLValue(Address(V, Align), T, AlignSource);
+  LValueBaseInfo BaseInfo;
+  CharUnits Align = getNaturalTypeAlignment(T, &BaseInfo, /*pointee*/ true);
+  return MakeAddrLValue(Address(V, Align), T, BaseInfo);
 }
 
 
@@ -346,7 +349,7 @@ void CodeGenFunction::FinishFunction(SourceLocation EndLoc) {
 
   // Emit debug descriptor for function end.
   if (CGDebugInfo *DI = getDebugInfo())
-    DI->EmitFunctionEnd(Builder);
+    DI->EmitFunctionEnd(Builder, CurFn);
 
   // Reset the debug location to that of the simple 'return' expression, if any
   // rather than that of the end of the function's scope '}'.
@@ -610,11 +613,6 @@ static void GenOpenCLArgMetadata(const FunctionDecl *FD, llvm::Function *Fn,
 
       argBaseTypeNames.push_back(llvm::MDString::get(Context, baseTypeName));
 
-      // Get argument type qualifiers:
-      if (ty.isConstQualified())
-        typeQuals = "const";
-      if (ty.isVolatileQualified())
-        typeQuals += typeQuals.empty() ? "volatile" : " volatile";
       if (isPipe)
         typeQuals = "pipe";
     }
@@ -623,7 +621,10 @@ static void GenOpenCLArgMetadata(const FunctionDecl *FD, llvm::Function *Fn,
 
     // Get image and pipe access qualifier:
     if (ty->isImageType()|| ty->isPipeType()) {
-      const OpenCLAccessAttr *A = parm->getAttr<OpenCLAccessAttr>();
+      const Decl *PDecl = parm;
+      if (auto *TD = dyn_cast<TypedefType>(ty))
+        PDecl = TD->getDecl();
+      const OpenCLAccessAttr *A = PDecl->getAttr<OpenCLAccessAttr>();
       if (A && A->isWriteOnly())
         accessQuals.push_back(llvm::MDString::get(Context, "write_only"));
       else if (A && A->isReadWrite())
@@ -663,34 +664,42 @@ void CodeGenFunction::EmitOpenCLKernelMetadata(const FunctionDecl *FD,
   GenOpenCLArgMetadata(FD, Fn, CGM, Context, Builder, getContext());
 
   if (const VecTypeHintAttr *A = FD->getAttr<VecTypeHintAttr>()) {
-    QualType hintQTy = A->getTypeHint();
-    const ExtVectorType *hintEltQTy = hintQTy->getAs<ExtVectorType>();
-    bool isSignedInteger =
-        hintQTy->isSignedIntegerType() ||
-        (hintEltQTy && hintEltQTy->getElementType()->isSignedIntegerType());
-    llvm::Metadata *attrMDArgs[] = {
+    QualType HintQTy = A->getTypeHint();
+    const ExtVectorType *HintEltQTy = HintQTy->getAs<ExtVectorType>();
+    bool IsSignedInteger =
+        HintQTy->isSignedIntegerType() ||
+        (HintEltQTy && HintEltQTy->getElementType()->isSignedIntegerType());
+    llvm::Metadata *AttrMDArgs[] = {
         llvm::ConstantAsMetadata::get(llvm::UndefValue::get(
             CGM.getTypes().ConvertType(A->getTypeHint()))),
         llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
             llvm::IntegerType::get(Context, 32),
-            llvm::APInt(32, (uint64_t)(isSignedInteger ? 1 : 0))))};
-    Fn->setMetadata("vec_type_hint", llvm::MDNode::get(Context, attrMDArgs));
+            llvm::APInt(32, (uint64_t)(IsSignedInteger ? 1 : 0))))};
+    Fn->setMetadata("vec_type_hint", llvm::MDNode::get(Context, AttrMDArgs));
   }
 
   if (const WorkGroupSizeHintAttr *A = FD->getAttr<WorkGroupSizeHintAttr>()) {
-    llvm::Metadata *attrMDArgs[] = {
+    llvm::Metadata *AttrMDArgs[] = {
         llvm::ConstantAsMetadata::get(Builder.getInt32(A->getXDim())),
         llvm::ConstantAsMetadata::get(Builder.getInt32(A->getYDim())),
         llvm::ConstantAsMetadata::get(Builder.getInt32(A->getZDim()))};
-    Fn->setMetadata("work_group_size_hint", llvm::MDNode::get(Context, attrMDArgs));
+    Fn->setMetadata("work_group_size_hint", llvm::MDNode::get(Context, AttrMDArgs));
   }
 
   if (const ReqdWorkGroupSizeAttr *A = FD->getAttr<ReqdWorkGroupSizeAttr>()) {
-    llvm::Metadata *attrMDArgs[] = {
+    llvm::Metadata *AttrMDArgs[] = {
         llvm::ConstantAsMetadata::get(Builder.getInt32(A->getXDim())),
         llvm::ConstantAsMetadata::get(Builder.getInt32(A->getYDim())),
         llvm::ConstantAsMetadata::get(Builder.getInt32(A->getZDim()))};
-    Fn->setMetadata("reqd_work_group_size", llvm::MDNode::get(Context, attrMDArgs));
+    Fn->setMetadata("reqd_work_group_size", llvm::MDNode::get(Context, AttrMDArgs));
+  }
+
+  if (const OpenCLIntelReqdSubGroupSizeAttr *A =
+          FD->getAttr<OpenCLIntelReqdSubGroupSizeAttr>()) {
+    llvm::Metadata *AttrMDArgs[] = {
+        llvm::ConstantAsMetadata::get(Builder.getInt32(A->getSubGroupSize()))};
+    Fn->setMetadata("intel_reqd_sub_group_size",
+                    llvm::MDNode::get(Context, AttrMDArgs));
   }
 }
 
@@ -713,6 +722,26 @@ static bool endsWithReturn(const Decl* F) {
 static void markAsIgnoreThreadCheckingAtRuntime(llvm::Function *Fn) {
   Fn->addFnAttr("sanitize_thread_no_checking_at_run_time");
   Fn->removeFnAttr(llvm::Attribute::SanitizeThread);
+}
+
+static bool matchesStlAllocatorFn(const Decl *D, const ASTContext &Ctx) {
+  auto *MD = dyn_cast_or_null<CXXMethodDecl>(D);
+  if (!MD || !MD->getDeclName().getAsIdentifierInfo() ||
+      !MD->getDeclName().getAsIdentifierInfo()->isStr("allocate") ||
+      (MD->getNumParams() != 1 && MD->getNumParams() != 2))
+    return false;
+
+  if (MD->parameters()[0]->getType().getCanonicalType() != Ctx.getSizeType())
+    return false;
+
+  if (MD->getNumParams() == 2) {
+    auto *PT = MD->parameters()[1]->getType()->getAs<PointerType>();
+    if (!PT || !PT->isVoidPointerType() ||
+        !PT->getPointeeType().isConstQualified())
+      return false;
+  }
+
+  return true;
 }
 
 void CodeGenFunction::StartFunction(GlobalDecl GD,
@@ -774,6 +803,14 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
     }
   }
 
+  // Ignore unrelated casts in STL allocate() since the allocator must cast
+  // from void* to T* before object initialization completes. Don't match on the
+  // namespace because not all allocators are in std::
+  if (D && SanOpts.has(SanitizerKind::CFIUnrelatedCast)) {
+    if (matchesStlAllocatorFn(D, getContext()))
+      SanOpts.Mask &= ~SanitizerKind::CFIUnrelatedCast;
+  }
+
   // Apply xray attributes to the function (as a string, for now)
   if (D && ShouldXRayInstrumentFunction()) {
     if (const auto *XRayAttr = D->getAttr<XRayInstrumentAttr>()) {
@@ -786,9 +823,10 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
                       llvm::utostr(LogArgs->getArgumentCount()));
       }
     } else {
-      Fn->addFnAttr(
-          "xray-instruction-threshold",
-          llvm::itostr(CGM.getCodeGenOpts().XRayInstructionThreshold));
+      if (!CGM.imbueXRayAttrs(Fn, Loc))
+        Fn->addFnAttr(
+            "xray-instruction-threshold",
+            llvm::itostr(CGM.getCodeGenOpts().XRayInstructionThreshold));
     }
   }
 
@@ -799,6 +837,10 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
   // Add no-jump-tables value.
   Fn->addFnAttr("no-jump-tables",
                 llvm::toStringRef(CGM.getCodeGenOpts().NoUseJumpTables));
+
+  // Add profile-sample-accurate value.
+  if (CGM.getCodeGenOpts().ProfileSampleAccurate)
+    Fn->addFnAttr("profile-sample-accurate");
 
   if (getLangOpts().OpenCL) {
     // Add metadata for a kernel function.
@@ -854,6 +896,13 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
 
   Builder.SetInsertPoint(EntryBB);
 
+  // If we're checking the return value, allocate space for a pointer to a
+  // precise source location of the checked return statement.
+  if (requiresReturnValueCheck()) {
+    ReturnLocation = CreateDefaultAlignTempAlloca(Int8PtrTy, "return.sloc.ptr");
+    InitTempAlloca(ReturnLocation, llvm::ConstantPointerNull::get(Int8PtrTy));
+  }
+
   // Emit subprogram debug descriptor.
   if (CGDebugInfo *DI = getDebugInfo()) {
     // Reconstruct the type from the argument list so that implicit parameters,
@@ -881,8 +930,10 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
   if (CGM.getCodeGenOpts().InstrumentForProfiling) {
     if (CGM.getCodeGenOpts().CallFEntry)
       Fn->addFnAttr("fentry-call", "true");
-    else
-      Fn->addFnAttr("counting-function", getTarget().getMCountName());
+    else {
+      if (!CurFuncDecl || !CurFuncDecl->hasAttr<NoInstrumentFunctionAttr>())
+        Fn->addFnAttr("counting-function", getTarget().getMCountName());
+    }
   }
 
   if (RetTy->isVoidType()) {
@@ -967,13 +1018,25 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
       CXXThisValue = CXXABIThisValue;
     }
 
-    // Null-check the 'this' pointer once per function, if it's available.
-    if (CXXThisValue) {
+    // Check the 'this' pointer once per function, if it's available.
+    if (CXXABIThisValue) {
       SanitizerSet SkippedChecks;
-      SkippedChecks.set(SanitizerKind::Alignment, true);
       SkippedChecks.set(SanitizerKind::ObjectSize, true);
-      EmitTypeCheck(TCK_Load, Loc, CXXThisValue, MD->getThisType(getContext()),
-                    /*Alignment=*/CharUnits::Zero(), SkippedChecks);
+      QualType ThisTy = MD->getThisType(getContext());
+
+      // If this is the call operator of a lambda with no capture-default, it
+      // may have a static invoker function, which may call this operator with
+      // a null 'this' pointer.
+      if (isLambdaCallOperator(MD) &&
+          cast<CXXRecordDecl>(MD->getParent())->getLambdaCaptureDefault() ==
+              LCD_None)
+        SkippedChecks.set(SanitizerKind::Null, true);
+
+      EmitTypeCheck(isa<CXXConstructorDecl>(MD) ? TCK_ConstructorCall
+                                                : TCK_MemberCall,
+                    Loc, CXXABIThisValue, ThisTy,
+                    getContext().getTypeAlignInChars(ThisTy->getPointeeType()),
+                    SkippedChecks);
     }
   }
 
@@ -1076,10 +1139,9 @@ QualType CodeGenFunction::BuildFunctionArgList(GlobalDecl GD,
       if (!Param->hasAttr<PassObjectSizeAttr>())
         continue;
 
-      IdentifierInfo *NoID = nullptr;
       auto *Implicit = ImplicitParamDecl::Create(
-          getContext(), Param->getDeclContext(), Param->getLocation(), NoID,
-          getContext().getSizeType());
+          getContext(), Param->getDeclContext(), Param->getLocation(),
+          /*Id=*/nullptr, getContext().getSizeType(), ImplicitParamDecl::Other);
       SizeArguments[Param] = Implicit;
       Args.push_back(Implicit);
     }
@@ -1158,16 +1220,11 @@ void CodeGenFunction::GenerateCode(GlobalDecl GD, llvm::Function *Fn,
            !getLangOpts().CUDAIsDevice &&
            FD->hasAttr<CUDAGlobalAttr>())
     CGM.getCUDARuntime().emitDeviceStub(*this, Args);
-  else if (isa<CXXConversionDecl>(FD) &&
-           cast<CXXConversionDecl>(FD)->isLambdaToBlockPointerConversion()) {
-    // The lambda conversion to block pointer is special; the semantics can't be
-    // expressed in the AST, so IRGen needs to special-case it.
-    EmitLambdaToBlockPointerBody(Args);
-  } else if (isa<CXXMethodDecl>(FD) &&
-             cast<CXXMethodDecl>(FD)->isLambdaStaticInvoker()) {
+  else if (isa<CXXMethodDecl>(FD) &&
+           cast<CXXMethodDecl>(FD)->isLambdaStaticInvoker()) {
     // The lambda static invoker function is special, because it forwards or
     // clones the body of the function call operator (but is actually static).
-    EmitLambdaStaticInvokeFunction(cast<CXXMethodDecl>(FD));
+    EmitLambdaStaticInvokeBody(cast<CXXMethodDecl>(FD));
   } else if (FD->isDefaulted() && isa<CXXMethodDecl>(FD) &&
              (cast<CXXMethodDecl>(FD)->isCopyAssignmentOperator() ||
               cast<CXXMethodDecl>(FD)->isMoveAssignmentOperator())) {

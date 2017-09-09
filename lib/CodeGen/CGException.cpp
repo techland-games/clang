@@ -15,6 +15,7 @@
 #include "CGCXXABI.h"
 #include "CGCleanup.h"
 #include "CGObjCRuntime.h"
+#include "ConstantEmitter.h"
 #include "TargetInfo.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/StmtCXX.h"
@@ -180,8 +181,8 @@ static const EHPersonality &getObjCXXPersonality(const llvm::Triple &T,
   // The GCC runtime's personality function inherently doesn't support
   // mixed EH.  Use the C++ personality just to avoid returning null.
   case ObjCRuntime::GCC:
-  case ObjCRuntime::ObjFW: // XXX: this will change soon
-    return EHPersonality::GNU_ObjC;
+  case ObjCRuntime::ObjFW:
+    return getObjCPersonality(T, L);
   case ObjCRuntime::GNUstep:
     return EHPersonality::GNU_ObjCXX;
   }
@@ -231,7 +232,7 @@ static llvm::Constant *getPersonalityFn(CodeGenModule &CGM,
                                         const EHPersonality &Personality) {
   return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.Int32Ty, true),
                                    Personality.PersonalityFn,
-                                   llvm::AttributeSet(), /*Local=*/true);
+                                   llvm::AttributeList(), /*Local=*/true);
 }
 
 static llvm::Constant *getOpaquePersonalityFn(CodeGenModule &CGM,
@@ -765,8 +766,8 @@ llvm::BasicBlock *CodeGenFunction::EmitLandingPad() {
   llvm::BasicBlock *lpad = createBasicBlock("lpad");
   EmitBlock(lpad);
 
-  llvm::LandingPadInst *LPadInst = Builder.CreateLandingPad(
-      llvm::StructType::get(Int8PtrTy, Int32Ty, nullptr), 0);
+  llvm::LandingPadInst *LPadInst =
+      Builder.CreateLandingPad(llvm::StructType::get(Int8PtrTy, Int32Ty), 0);
 
   llvm::Value *LPadExn = Builder.CreateExtractValue(LPadInst, 0);
   Builder.CreateStore(LPadExn, getExceptionSlot());
@@ -1310,8 +1311,8 @@ llvm::BasicBlock *CodeGenFunction::getTerminateLandingPad() {
   if (!CurFn->hasPersonalityFn())
     CurFn->setPersonalityFn(getOpaquePersonalityFn(CGM, Personality));
 
-  llvm::LandingPadInst *LPadInst = Builder.CreateLandingPad(
-      llvm::StructType::get(Int8PtrTy, Int32Ty, nullptr), 0);
+  llvm::LandingPadInst *LPadInst =
+      Builder.CreateLandingPad(llvm::StructType::get(Int8PtrTy, Int32Ty), 0);
   LPadInst->addClause(getCatchAllValue(*this));
 
   llvm::Value *Exn = nullptr;
@@ -1387,8 +1388,7 @@ llvm::BasicBlock *CodeGenFunction::getEHResumeBlock(bool isCleanup) {
   llvm::Value *Exn = getExceptionFromSlot();
   llvm::Value *Sel = getSelectorFromSlot();
 
-  llvm::Type *LPadType = llvm::StructType::get(Exn->getType(),
-                                               Sel->getType(), nullptr);
+  llvm::Type *LPadType = llvm::StructType::get(Exn->getType(), Sel->getType());
   llvm::Value *LPadVal = llvm::UndefValue::get(LPadType);
   LPadVal = Builder.CreateInsertValue(LPadVal, Exn, 0, "lpad.val");
   LPadVal = Builder.CreateInsertValue(LPadVal, Sel, 1, "lpad.val");
@@ -1650,18 +1650,19 @@ void CodeGenFunction::startOutlinedSEHHelper(CodeGenFunction &ParentCGF,
     // parameters. Win32 filters take no parameters.
     if (IsFilter) {
       Args.push_back(ImplicitParamDecl::Create(
-          getContext(), nullptr, StartLoc,
+          getContext(), /*DC=*/nullptr, StartLoc,
           &getContext().Idents.get("exception_pointers"),
-          getContext().VoidPtrTy));
+          getContext().VoidPtrTy, ImplicitParamDecl::Other));
     } else {
       Args.push_back(ImplicitParamDecl::Create(
-          getContext(), nullptr, StartLoc,
+          getContext(), /*DC=*/nullptr, StartLoc,
           &getContext().Idents.get("abnormal_termination"),
-          getContext().UnsignedCharTy));
+          getContext().UnsignedCharTy, ImplicitParamDecl::Other));
     }
     Args.push_back(ImplicitParamDecl::Create(
-        getContext(), nullptr, StartLoc,
-        &getContext().Idents.get("frame_pointer"), getContext().VoidPtrTy));
+        getContext(), /*DC=*/nullptr, StartLoc,
+        &getContext().Idents.get("frame_pointer"), getContext().VoidPtrTy,
+        ImplicitParamDecl::Other));
   }
 
   QualType RetTy = IsFilter ? getContext().LongTy : getContext().VoidTy;
@@ -1747,7 +1748,7 @@ void CodeGenFunction::EmitSEHExceptionCodeSave(CodeGenFunction &ParentCGF,
   // };
   // int exceptioncode = exception_pointers->ExceptionRecord->ExceptionCode;
   llvm::Type *RecordTy = CGM.Int32Ty->getPointerTo();
-  llvm::Type *PtrsTy = llvm::StructType::get(RecordTy, CGM.VoidPtrTy, nullptr);
+  llvm::Type *PtrsTy = llvm::StructType::get(RecordTy, CGM.VoidPtrTy);
   llvm::Value *Ptrs = Builder.CreateBitCast(SEHInfo, PtrsTy->getPointerTo());
   llvm::Value *Rec = Builder.CreateStructGEP(PtrsTy, Ptrs, 0);
   Rec = Builder.CreateAlignedLoad(Rec, getPointerAlign());
@@ -1800,7 +1801,8 @@ void CodeGenFunction::EnterSEHTryStmt(const SEHTryStmt &S) {
   // "catch i8* null". We can't do this on x86 because the filter has to save
   // the exception code.
   llvm::Constant *C =
-      CGM.EmitConstantExpr(Except->getFilterExpr(), getContext().IntTy, this);
+    ConstantEmitter(*this).tryEmitAbstract(Except->getFilterExpr(),
+                                           getContext().IntTy);
   if (CGM.getTarget().getTriple().getArch() != llvm::Triple::x86 && C &&
       C->isOneValue()) {
     CatchScope->setCatchAllHandler(0, createBasicBlock("__except"));

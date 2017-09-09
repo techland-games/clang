@@ -48,10 +48,9 @@ namespace clang {
 
 namespace llvm {
   template <typename T>
-  class PointerLikeTypeTraits;
+  struct PointerLikeTypeTraits;
   template<>
-  class PointerLikeTypeTraits< ::clang::Type*> {
-  public:
+  struct PointerLikeTypeTraits< ::clang::Type*> {
     static inline void *getAsVoidPointer(::clang::Type *P) { return P; }
     static inline ::clang::Type *getFromVoidPointer(void *P) {
       return static_cast< ::clang::Type*>(P);
@@ -59,8 +58,7 @@ namespace llvm {
     enum { NumLowBitsAvailable = clang::TypeAlignmentInBits };
   };
   template<>
-  class PointerLikeTypeTraits< ::clang::ExtQuals*> {
-  public:
+  struct PointerLikeTypeTraits< ::clang::ExtQuals*> {
     static inline void *getAsVoidPointer(::clang::ExtQuals *P) { return P; }
     static inline ::clang::ExtQuals *getFromVoidPointer(void *P) {
       return static_cast< ::clang::ExtQuals*>(P);
@@ -333,6 +331,23 @@ public:
 
   bool hasAddressSpace() const { return Mask & AddressSpaceMask; }
   unsigned getAddressSpace() const { return Mask >> AddressSpaceShift; }
+  bool hasTargetSpecificAddressSpace() const {
+    return getAddressSpace() >= LangAS::FirstTargetAddressSpace;
+  }
+  /// Get the address space attribute value to be printed by diagnostics.
+  unsigned getAddressSpaceAttributePrintValue() const {
+    auto Addr = getAddressSpace();
+    // This function is not supposed to be used with language specific
+    // address spaces. If that happens, the diagnostic message should consider
+    // printing the QualType instead of the address space value.
+    assert(Addr == 0 || hasTargetSpecificAddressSpace());
+    if (Addr)
+      return Addr - LangAS::FirstTargetAddressSpace;
+    // TODO: The diagnostic messages where Addr may be 0 should be fixed
+    // since it cannot differentiate the situation where 0 denotes the default
+    // address space or user specified __attribute__((address_space(0))).
+    return 0;
+  }
   void setAddressSpace(unsigned space) {
     assert(space <= MaxAddressSpace);
     Mask = (Mask & ~AddressSpaceMask)
@@ -1020,6 +1035,9 @@ public:
     return getQualifiers().hasStrongOrWeakObjCLifetime();
   }
 
+  // true when Type is objc's weak and weak is enabled but ARC isn't.
+  bool isNonWeakInMRRWithObjCWeak(const ASTContext &Context) const;
+
   enum DestructionKind {
     DK_none,
     DK_cxx_destructor,
@@ -1123,8 +1141,7 @@ template<> struct simplify_type< ::clang::QualType> {
 
 // Teach SmallPtrSet that QualType is "basically a pointer".
 template<>
-class PointerLikeTypeTraits<clang::QualType> {
-public:
+struct PointerLikeTypeTraits<clang::QualType> {
   static inline void *getAsVoidPointer(clang::QualType P) {
     return P.getAsOpaquePtr();
   }
@@ -1379,7 +1396,7 @@ protected:
 
     /// Extra information which affects how the function is called, like
     /// regparm and the calling convention.
-    unsigned ExtInfo : 10;
+    unsigned ExtInfo : 11;
 
     /// Used only by FunctionProtoType, put here to pack with the
     /// other bitfields.
@@ -1732,6 +1749,7 @@ public:
   bool isTemplateTypeParmType() const;          // C++ template type parameter
   bool isNullPtrType() const;                   // C++11 std::nullptr_t
   bool isAlignValT() const;                     // C++17 std::align_val_t
+  bool isStdByteType() const;                   // C++17 std::byte
   bool isAtomicType() const;                    // C11 _Atomic()
 
 #define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix) \
@@ -1991,10 +2009,11 @@ public:
   Optional<NullabilityKind> getNullability(const ASTContext &context) const;
 
   /// Determine whether the given type can have a nullability
-  /// specifier applied to it, i.e., if it is any kind of pointer type
-  /// or a dependent type that could instantiate to any kind of
-  /// pointer type.
-  bool canHaveNullability() const;
+  /// specifier applied to it, i.e., if it is any kind of pointer type.
+  ///
+  /// \param ResultIfUnknown The value to return if we don't yet know whether
+  ///        this type can have nullability because it is dependent.
+  bool canHaveNullability(bool ResultIfUnknown = true) const;
 
   /// Retrieve the set of substitutions required when accessing a member
   /// of the Objective-C receiver type that is declared in the given context.
@@ -2076,7 +2095,7 @@ public:
     : Type(Builtin, QualType(), /*Dependent=*/(K == Dependent),
            /*InstantiationDependent=*/(K == Dependent),
            /*VariablyModified=*/false,
-           /*Unexpanded paramter pack=*/false) {
+           /*Unexpanded parameter pack=*/false) {
     BuiltinTypeBits.Kind = K;
   }
 
@@ -2924,19 +2943,23 @@ class FunctionType : public Type {
   // * AST read and write
   // * Codegen
   class ExtInfo {
-    // Feel free to rearrange or add bits, but if you go over 10,
+    // Feel free to rearrange or add bits, but if you go over 11,
     // you'll need to adjust both the Bits field below and
     // Type::FunctionTypeBitfields.
 
-    //   |  CC  |noreturn|produces|regparm|
-    //   |0 .. 4|   5    |    6   | 7 .. 9|
+    //   |  CC  |noreturn|produces|nocallersavedregs|regparm|
+    //   |0 .. 4|   5    |    6   |       7         |8 .. 10|
     //
     // regparm is either 0 (no regparm attribute) or the regparm value+1.
     enum { CallConvMask = 0x1F };
     enum { NoReturnMask = 0x20 };
     enum { ProducesResultMask = 0x40 };
-    enum { RegParmMask = ~(CallConvMask | NoReturnMask | ProducesResultMask),
-           RegParmOffset = 7 }; // Assumed to be the last field
+    enum { NoCallerSavedRegsMask = 0x80 };
+    enum {
+      RegParmMask = ~(CallConvMask | NoReturnMask | ProducesResultMask |
+                      NoCallerSavedRegsMask),
+      RegParmOffset = 8
+    }; // Assumed to be the last field
 
     uint16_t Bits;
 
@@ -2947,13 +2970,13 @@ class FunctionType : public Type {
    public:
     // Constructor with no defaults. Use this when you know that you
     // have all the elements (when reading an AST file for example).
-    ExtInfo(bool noReturn, bool hasRegParm, unsigned regParm, CallingConv cc,
-            bool producesResult) {
-      assert((!hasRegParm || regParm < 7) && "Invalid regparm value");
-      Bits = ((unsigned) cc) |
-             (noReturn ? NoReturnMask : 0) |
-             (producesResult ? ProducesResultMask : 0) |
-             (hasRegParm ? ((regParm + 1) << RegParmOffset) : 0);
+     ExtInfo(bool noReturn, bool hasRegParm, unsigned regParm, CallingConv cc,
+             bool producesResult, bool noCallerSavedRegs) {
+       assert((!hasRegParm || regParm < 7) && "Invalid regparm value");
+       Bits = ((unsigned)cc) | (noReturn ? NoReturnMask : 0) |
+              (producesResult ? ProducesResultMask : 0) |
+              (noCallerSavedRegs ? NoCallerSavedRegsMask : 0) |
+              (hasRegParm ? ((regParm + 1) << RegParmOffset) : 0);
     }
 
     // Constructor with all defaults. Use when for example creating a
@@ -2966,6 +2989,7 @@ class FunctionType : public Type {
 
     bool getNoReturn() const { return Bits & NoReturnMask; }
     bool getProducesResult() const { return Bits & ProducesResultMask; }
+    bool getNoCallerSavedRegs() const { return Bits & NoCallerSavedRegsMask; }
     bool getHasRegParm() const { return (Bits >> RegParmOffset) != 0; }
     unsigned getRegParm() const {
       unsigned RegParm = Bits >> RegParmOffset;
@@ -2997,6 +3021,13 @@ class FunctionType : public Type {
         return ExtInfo(Bits | ProducesResultMask);
       else
         return ExtInfo(Bits & ~ProducesResultMask);
+    }
+
+    ExtInfo withNoCallerSavedRegs(bool noCallerSavedRegs) const {
+      if (noCallerSavedRegs)
+        return ExtInfo(Bits | NoCallerSavedRegsMask);
+      else
+        return ExtInfo(Bits & ~NoCallerSavedRegsMask);
     }
 
     ExtInfo withRegParm(unsigned RegParm) const {
@@ -3845,6 +3876,7 @@ public:
     attr_sptr,
     attr_uptr,
     attr_nonnull,
+    attr_ns_returns_retained,
     attr_nullable,
     attr_null_unspecified,
     attr_objc_kindof,

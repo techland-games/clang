@@ -97,9 +97,6 @@ bool CallEvent::hasNonNullArgumentsWithType(bool (*Condition)(QualType)) const {
   for (CallEvent::param_type_iterator I = param_type_begin(),
                                       E = param_type_end();
        I != E && Idx < NumOfArgs; ++I, ++Idx) {
-    if (NumOfArgs <= Idx)
-      break;
-
     // If the parameter is 0, it's harmless.
     if (getArgSVal(Idx).isZeroConstant())
       continue;
@@ -344,6 +341,22 @@ ArrayRef<ParmVarDecl*> AnyFunctionCall::parameters() const {
   if (!D)
     return None;
   return D->parameters();
+}
+
+
+RuntimeDefinition AnyFunctionCall::getRuntimeDefinition() const {
+  const FunctionDecl *FD = getDecl();
+  // Note that the AnalysisDeclContext will have the FunctionDecl with
+  // the definition (if one exists).
+  if (FD) {
+    AnalysisDeclContext *AD =
+      getLocationContext()->getAnalysisDeclContext()->
+      getManager()->getContext(FD);
+    if (AD->getBody())
+      return RuntimeDefinition(AD->getDecl());
+  }
+
+  return RuntimeDefinition();
 }
 
 void AnyFunctionCall::getInitialStackFrameContents(
@@ -695,13 +708,15 @@ void ObjCMethodCall::getExtraInvalidatedValues(
   if (const ObjCPropertyDecl *PropDecl = getAccessedProperty()) {
     if (const ObjCIvarDecl *PropIvar = PropDecl->getPropertyIvarDecl()) {
       SVal IvarLVal = getState()->getLValue(PropIvar, getReceiverSVal());
-      const MemRegion *IvarRegion = IvarLVal.getAsRegion();
-      ETraits->setTrait(
+      if (const MemRegion *IvarRegion = IvarLVal.getAsRegion()) {
+        ETraits->setTrait(
           IvarRegion,
           RegionAndSymbolInvalidationTraits::TK_DoNotInvalidateSuperRegion);
-      ETraits->setTrait(IvarRegion,
-                        RegionAndSymbolInvalidationTraits::TK_SuppressEscape);
-      Values.push_back(IvarLVal);
+        ETraits->setTrait(
+          IvarRegion,
+          RegionAndSymbolInvalidationTraits::TK_SuppressEscape);
+        Values.push_back(IvarLVal);
+      }
       return;
     }
   }
@@ -955,6 +970,12 @@ RuntimeDefinition ObjCMethodCall::getRuntimeDefinition() const {
         return RuntimeDefinition();
 
       DynamicTypeInfo DTI = getDynamicTypeInfo(getState(), Receiver);
+      if (!DTI.isValid()) {
+        assert(isa<AllocaRegion>(Receiver) &&
+               "Unhandled untyped region class!");
+        return RuntimeDefinition();
+      }
+
       QualType DynType = DTI.getType();
       CanBeSubClassed = DTI.canBeASubClass();
       ReceiverT = dyn_cast<ObjCObjectPointerType>(DynType.getCanonicalType());

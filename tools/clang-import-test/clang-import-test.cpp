@@ -9,19 +9,25 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTImporter.h"
+#include "clang/AST/DeclObjC.h"
+#include "clang/AST/ExternalASTMerger.h"
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TargetOptions.h"
 #include "clang/CodeGen/ModuleBuilder.h"
+#include "clang/Driver/Types.h"
+#include "clang/Frontend/ASTConsumers.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Parse/ParseAST.h"
 
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Host.h"
@@ -40,10 +46,27 @@ static llvm::cl::list<std::string>
     Imports("import", llvm::cl::ZeroOrMore,
             llvm::cl::desc("Path to a file containing declarations to import"));
 
+static llvm::cl::opt<bool>
+    Direct("direct", llvm::cl::Optional,
+             llvm::cl::desc("Use the parsed declarations without indirection"));
+
 static llvm::cl::list<std::string>
     ClangArgs("Xcc", llvm::cl::ZeroOrMore,
               llvm::cl::desc("Argument to pass to the CompilerInvocation"),
               llvm::cl::CommaSeparated);
+
+static llvm::cl::opt<std::string>
+    Input("x", llvm::cl::Optional,
+          llvm::cl::desc("The language to parse (default: c++)"),
+          llvm::cl::init("c++"));
+
+static llvm::cl::opt<bool>
+DumpAST("dump-ast", llvm::cl::init(false),
+        llvm::cl::desc("Dump combined AST"));
+
+static llvm::cl::opt<bool>
+DumpIR("dump-ir", llvm::cl::init(false),
+        llvm::cl::desc("Dump IR from final parse"));
 
 namespace init_convenience {
 class TestDiagnosticConsumer : public DiagnosticConsumer {
@@ -98,6 +121,7 @@ private:
     llvm::errs() << LineString << '\n';
     llvm::errs().indent(LocColumn);
     llvm::errs() << '^';
+    llvm::errs() << '\n';
   }
 
   virtual void HandleDiagnostic(DiagnosticsEngine::Level DiagLevel,
@@ -131,7 +155,7 @@ private:
 };
 
 std::unique_ptr<CompilerInstance>
-BuildCompilerInstance(ArrayRef<const char *> ClangArgv) {
+BuildCompilerInstance() {
   auto Ins = llvm::make_unique<CompilerInstance>();
   auto DC = llvm::make_unique<TestDiagnosticConsumer>();
   const bool ShouldOwnClient = true;
@@ -139,13 +163,27 @@ BuildCompilerInstance(ArrayRef<const char *> ClangArgv) {
 
   auto Inv = llvm::make_unique<CompilerInvocation>();
 
+  std::vector<const char *> ClangArgv(ClangArgs.size());
+  std::transform(ClangArgs.begin(), ClangArgs.end(), ClangArgv.begin(),
+                 [](const std::string &s) -> const char * { return s.data(); });
   CompilerInvocation::CreateFromArgs(*Inv, ClangArgv.data(),
                                      &ClangArgv.data()[ClangArgv.size()],
                                      Ins->getDiagnostics());
 
-  Inv->getLangOpts()->CPlusPlus = true;
-  Inv->getLangOpts()->CPlusPlus11 = true;
-  Inv->getHeaderSearchOpts().UseLibcxx = true;
+  {
+    using namespace driver::types;
+    ID Id = lookupTypeForTypeSpecifier(Input.c_str());
+    assert(Id != TY_INVALID);
+    if (isCXX(Id)) {
+      Inv->getLangOpts()->CPlusPlus = true;
+      Inv->getLangOpts()->CPlusPlus11 = true;
+      Inv->getHeaderSearchOpts().UseLibcxx = true;
+    }
+    if (isObjC(Id)) {
+      Inv->getLangOpts()->ObjC1 = 1;
+      Inv->getLangOpts()->ObjC2 = 1;
+    }
+  }
   Inv->getLangOpts()->Bool = true;
   Inv->getLangOpts()->WChar = true;
   Inv->getLangOpts()->Blocks = true;
@@ -189,65 +227,34 @@ std::unique_ptr<CodeGenerator> BuildCodeGen(CompilerInstance &CI,
 } // end namespace
 
 namespace {
-class TestExternalASTSource : public ExternalASTSource {
-private:
-  llvm::ArrayRef<std::unique_ptr<CompilerInstance>> ImportCIs;
-  std::map<CompilerInstance *, std::unique_ptr<ASTImporter>> ForwardImporters;
-  std::map<CompilerInstance *, std::unique_ptr<ASTImporter>> ReverseImporters;
-
-public:
-  TestExternalASTSource(
-      CompilerInstance &ExpressionCI,
-      llvm::ArrayRef<std::unique_ptr<CompilerInstance>> ImportCIs)
-      : ImportCIs(ImportCIs) {
-    for (const std::unique_ptr<CompilerInstance> &ImportCI : ImportCIs) {
-      ForwardImporters[ImportCI.get()] = llvm::make_unique<ASTImporter>(
-          ExpressionCI.getASTContext(), ExpressionCI.getFileManager(),
-          ImportCI->getASTContext(), ImportCI->getFileManager(),
-          /*MinimalImport=*/true);
-      ReverseImporters[ImportCI.get()] = llvm::make_unique<ASTImporter>(
-          ImportCI->getASTContext(), ImportCI->getFileManager(),
-          ExpressionCI.getASTContext(), ExpressionCI.getFileManager(),
-          /*MinimalImport=*/true);
-    }
-  }
-
-  bool FindExternalVisibleDeclsByName(const DeclContext *DC,
-                                      DeclarationName Name) override {
-    llvm::SmallVector<NamedDecl *, 1> Decls;
-
-    if (isa<TranslationUnitDecl>(DC)) {
-      for (const std::unique_ptr<CompilerInstance> &I : ImportCIs) {
-        DeclarationName FromName = ReverseImporters[I.get()]->Import(Name);
-        DeclContextLookupResult Result =
-            I->getASTContext().getTranslationUnitDecl()->lookup(FromName);
-        for (NamedDecl *FromD : Result) {
-          NamedDecl *D =
-              llvm::cast<NamedDecl>(ForwardImporters[I.get()]->Import(FromD));
-          Decls.push_back(D);
-        }
-      }
-    }
-    if (Decls.empty()) {
-      return false;
-    } else {
-      SetExternalVisibleDeclsForName(DC, Name, Decls);
-      return true;
-    }
-  }
-};
-
+ 
 void AddExternalSource(
     CompilerInstance &CI,
     llvm::ArrayRef<std::unique_ptr<CompilerInstance>> Imports) {
-  ASTContext &AST = CI.getASTContext();
-  auto ES = llvm::make_unique<TestExternalASTSource>(CI, Imports);
-  AST.setExternalSource(ES.release());
-  AST.getTranslationUnitDecl()->setHasExternalVisibleStorage();
+  ExternalASTMerger::ImporterEndpoint Target({CI.getASTContext(), CI.getFileManager()});
+  llvm::SmallVector<ExternalASTMerger::ImporterEndpoint, 3> Sources;
+  for (const std::unique_ptr<CompilerInstance> &CI : Imports) {
+    Sources.push_back({CI->getASTContext(), CI->getFileManager()});
+  }
+  auto ES = llvm::make_unique<ExternalASTMerger>(Target, Sources);
+  CI.getASTContext().setExternalSource(ES.release());
+  CI.getASTContext().getTranslationUnitDecl()->setHasExternalVisibleStorage();
+}
+
+std::unique_ptr<CompilerInstance> BuildIndirect(std::unique_ptr<CompilerInstance> &CI) {
+  std::unique_ptr<CompilerInstance> IndirectCI =
+      init_convenience::BuildCompilerInstance();
+  auto ST = llvm::make_unique<SelectorTable>();
+  auto BC = llvm::make_unique<Builtin::Context>();
+  std::unique_ptr<ASTContext> AST =
+      init_convenience::BuildASTContext(*IndirectCI, *ST, *BC);
+  IndirectCI->setASTContext(AST.release());
+  AddExternalSource(*IndirectCI, CI);
+  return IndirectCI;
 }
 
 llvm::Error ParseSource(const std::string &Path, CompilerInstance &CI,
-                        CodeGenerator &CG) {
+                        ASTConsumer &Consumer) {
   SourceManager &SM = CI.getSourceManager();
   const FileEntry *FE = CI.getFileManager().getFile(Path);
   if (!FE) {
@@ -255,36 +262,44 @@ llvm::Error ParseSource(const std::string &Path, CompilerInstance &CI,
         llvm::Twine("Couldn't open ", Path), std::error_code());
   }
   SM.setMainFileID(SM.createFileID(FE, SourceLocation(), SrcMgr::C_User));
-  ParseAST(CI.getPreprocessor(), &CG, CI.getASTContext());
+  ParseAST(CI.getPreprocessor(), &Consumer, CI.getASTContext());
   return llvm::Error::success();
 }
 
 llvm::Expected<std::unique_ptr<CompilerInstance>>
 Parse(const std::string &Path,
-      llvm::ArrayRef<std::unique_ptr<CompilerInstance>> Imports) {
-  std::vector<const char *> ClangArgv(ClangArgs.size());
-  std::transform(ClangArgs.begin(), ClangArgs.end(), ClangArgv.begin(),
-                 [](const std::string &s) -> const char * { return s.data(); });
+      llvm::ArrayRef<std::unique_ptr<CompilerInstance>> Imports,
+      bool ShouldDumpAST, bool ShouldDumpIR) {
   std::unique_ptr<CompilerInstance> CI =
-      init_convenience::BuildCompilerInstance(ClangArgv);
+      init_convenience::BuildCompilerInstance();
   auto ST = llvm::make_unique<SelectorTable>();
   auto BC = llvm::make_unique<Builtin::Context>();
   std::unique_ptr<ASTContext> AST =
       init_convenience::BuildASTContext(*CI, *ST, *BC);
   CI->setASTContext(AST.release());
-  AddExternalSource(*CI, Imports);
+  if (Imports.size())
+    AddExternalSource(*CI, Imports);
+
+  std::vector<std::unique_ptr<ASTConsumer>> ASTConsumers;
 
   auto LLVMCtx = llvm::make_unique<llvm::LLVMContext>();
-  std::unique_ptr<CodeGenerator> CG =
-      init_convenience::BuildCodeGen(*CI, *LLVMCtx);
-  CG->Initialize(CI->getASTContext());
+  ASTConsumers.push_back(init_convenience::BuildCodeGen(*CI, *LLVMCtx));
+  auto &CG = *static_cast<CodeGenerator*>(ASTConsumers.back().get());
+
+  if (ShouldDumpAST)
+    ASTConsumers.push_back(CreateASTDumper("", true, false, false));
 
   CI->getDiagnosticClient().BeginSourceFile(CI->getLangOpts(),
                                             &CI->getPreprocessor());
-  if (llvm::Error PE = ParseSource(Path, *CI, *CG)) {
+  MultiplexConsumer Consumers(std::move(ASTConsumers));
+  Consumers.Initialize(CI->getASTContext());
+
+  if (llvm::Error PE = ParseSource(Path, *CI, Consumers)) {
     return std::move(PE);
   }
   CI->getDiagnosticClient().EndSourceFile();
+  if (ShouldDumpIR)
+    CG.GetModule()->print(llvm::outs(), nullptr);
   if (CI->getDiagnosticClient().getNumErrors()) {
     return llvm::make_error<llvm::StringError>(
         "Errors occured while parsing the expression.", std::error_code());
@@ -292,6 +307,7 @@ Parse(const std::string &Path,
     return std::move(CI);
   }
 }
+
 } // end namespace
 
 int main(int argc, const char **argv) {
@@ -300,7 +316,8 @@ int main(int argc, const char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv);
   std::vector<std::unique_ptr<CompilerInstance>> ImportCIs;
   for (auto I : Imports) {
-    llvm::Expected<std::unique_ptr<CompilerInstance>> ImportCI = Parse(I, {});
+    llvm::Expected<std::unique_ptr<CompilerInstance>> ImportCI =
+      Parse(I, {}, false, false);
     if (auto E = ImportCI.takeError()) {
       llvm::errs() << llvm::toString(std::move(E));
       exit(-1);
@@ -308,8 +325,15 @@ int main(int argc, const char **argv) {
       ImportCIs.push_back(std::move(*ImportCI));
     }
   }
+  std::vector<std::unique_ptr<CompilerInstance>> IndirectCIs;
+  if (!Direct) {
+    for (auto &ImportCI : ImportCIs) {
+      std::unique_ptr<CompilerInstance> IndirectCI = BuildIndirect(ImportCI);
+      IndirectCIs.push_back(std::move(IndirectCI));
+    }
+  }
   llvm::Expected<std::unique_ptr<CompilerInstance>> ExpressionCI =
-      Parse(Expression, ImportCIs);
+      Parse(Expression, Direct ? ImportCIs : IndirectCIs, DumpAST, DumpIR);
   if (auto E = ExpressionCI.takeError()) {
     llvm::errs() << llvm::toString(std::move(E));
     exit(-1);
@@ -317,3 +341,4 @@ int main(int argc, const char **argv) {
     return 0;
   }
 }
+

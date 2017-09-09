@@ -537,6 +537,7 @@ namespace  {
     void VisitCXXBoolLiteralExpr(const CXXBoolLiteralExpr *Node);
     void VisitCXXThisExpr(const CXXThisExpr *Node);
     void VisitCXXFunctionalCastExpr(const CXXFunctionalCastExpr *Node);
+    void VisitCXXUnresolvedConstructExpr(const CXXUnresolvedConstructExpr *Node);
     void VisitCXXConstructExpr(const CXXConstructExpr *Node);
     void VisitCXXBindTemporaryExpr(const CXXBindTemporaryExpr *Node);
     void VisitCXXNewExpr(const CXXNewExpr *Node);
@@ -1038,10 +1039,10 @@ void ASTDumper::dumpDecl(const Decl *D) {
     dumpSourceRange(D->getSourceRange());
     OS << ' ';
     dumpLocation(D->getLocation());
-    if (Module *M = D->getImportedOwningModule())
+    if (D->isFromASTFile())
+      OS << " imported";
+    if (Module *M = D->getOwningModule())
       OS << " in " << M->getFullModuleName();
-    else if (Module *M = D->getLocalOwningModule())
-      OS << " in (local) " << M->getFullModuleName();
     if (auto *ND = dyn_cast<NamedDecl>(D))
       for (Module *M : D->getASTContext().getModulesWithMergedDefinition(
                const_cast<NamedDecl *>(ND)))
@@ -1184,6 +1185,30 @@ void ASTDumper::VisitFunctionDecl(const FunctionDecl *D) {
          I != E; ++I)
       dumpCXXCtorInitializer(*I);
 
+  if (const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(D)) {
+    if (MD->size_overridden_methods() != 0) {
+      auto dumpOverride =
+        [=](const CXXMethodDecl *D) {
+          SplitQualType T_split = D->getType().split();
+          OS << D << " " << D->getParent()->getName() << "::"
+             << D->getNameAsString() << " '" << QualType::getAsString(T_split) << "'";
+        };
+
+      dumpChild([=] {
+        auto FirstOverrideItr = MD->begin_overridden_methods();
+        OS << "Overrides: [ ";
+        dumpOverride(*FirstOverrideItr);
+        for (const auto *Override :
+               llvm::make_range(FirstOverrideItr + 1,
+                                MD->end_overridden_methods())) {
+          OS << ", ";
+          dumpOverride(Override);
+        }
+        OS << " ]";
+      });
+    }
+  }
+
   if (D->doesThisDeclarationHaveABody())
     dumpStmt(D->getBody());
 }
@@ -1292,6 +1317,16 @@ void ASTDumper::VisitOMPDeclareReductionDecl(const OMPDeclareReductionDecl *D) {
   dumpStmt(D->getCombiner());
   if (auto *Initializer = D->getInitializer()) {
     OS << " initializer";
+    switch (D->getInitializerKind()) {
+    case OMPDeclareReductionDecl::DirectInit:
+      OS << " omp_priv = ";
+      break;
+    case OMPDeclareReductionDecl::CopyInit:
+      OS << " omp_priv ()";
+      break;
+    case OMPDeclareReductionDecl::CallInit:
+      break;
+    }
     dumpStmt(Initializer);
   }
 }
@@ -2145,12 +2180,24 @@ void ASTDumper::VisitCXXFunctionalCastExpr(const CXXFunctionalCastExpr *Node) {
      << " <" << Node->getCastKindName() << ">";
 }
 
+void ASTDumper::VisitCXXUnresolvedConstructExpr(
+    const CXXUnresolvedConstructExpr *Node) {
+  VisitExpr(Node);
+  dumpType(Node->getTypeAsWritten());
+  if (Node->isListInitialization())
+    OS << " list";
+}
+
 void ASTDumper::VisitCXXConstructExpr(const CXXConstructExpr *Node) {
   VisitExpr(Node);
   CXXConstructorDecl *Ctor = Node->getConstructor();
   dumpType(Ctor->getType());
   if (Node->isElidable())
     OS << " elidable";
+  if (Node->isListInitialization())
+    OS << " list";
+  if (Node->isStdInitListInitialization())
+    OS << " std::initializer_list";
   if (Node->requiresZeroInitialization())
     OS << " zeroing";
 }

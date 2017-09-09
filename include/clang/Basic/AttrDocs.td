@@ -7,6 +7,24 @@
 //
 //===---------------------------------------------------------------------===//
 
+// To test that the documentation builds cleanly, you must run clang-tblgen to
+// convert the .td file into a .rst file, and then run sphinx to convert the
+// .rst file into an HTML file. After completing testing, you should revert the
+// generated .rst file so that the modified version does not get checked in to
+// version control.
+//
+// To run clang-tblgen to generate the .rst file:
+// clang-tblgen -gen-attr-docs -I <root>/llvm/tools/clang/include
+//   <root>/llvm/tools/clang/include/clang/Basic/Attr.td -o
+//   <root>/llvm/tools/clang/docs/AttributeReference.rst
+//
+// To run sphinx to generate the .html files (note that sphinx-build must be
+// available on the PATH):
+// Windows (from within the clang\docs directory):
+//   make.bat html
+// Non-Windows (from within the clang\docs directory):
+//   make -f Makefile.sphinx html
+
 def GlobalDocumentation {
   code Intro =[{..
   -------------------------------------------------------------------
@@ -241,6 +259,36 @@ An example of how to use ``alloc_size``
   this is unimportant, because LLVM has support for the ``alloc_size``
   attribute. However, this may cause mildly unintuitive behavior when used with
   other attributes, such as ``enable_if``.
+  }];
+}
+
+def AllocAlignDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+Use ``__attribute__((alloc_align(<alignment>))`` on a function
+declaration to specify that the return value of the function (which must be a
+pointer type) is at least as aligned as the value of the indicated parameter. The 
+parameter is given by its index in the list of formal parameters; the first
+parameter has index 1 unless the function is a C++ non-static member function,
+in which case the first parameter has index 2 to account for the implicit ``this``
+parameter.
+
+.. code-block:: c++
+
+  // The returned pointer has the alignment specified by the first parameter.
+  void *a(size_t align) __attribute__((alloc_align(1)));
+
+  // The returned pointer has the alignment specified by the second parameter.
+  void *b(void *v, size_t align) __attribute__((alloc_align(2)));
+
+  // The returned pointer has the alignment specified by the second visible
+  // parameter, however it must be adjusted for the implicit 'this' parameter.
+  void *Foo::b(void *v, size_t align) __attribute__((alloc_align(3)));
+
+Note that this attribute merely informs the compiler that a function always
+returns a sufficiently aligned pointer. It does not cause the compiler to 
+emit code to enforce that alignment.  The behavior is undefined if the returned
+poitner is not sufficiently aligned.
   }];
 }
 
@@ -575,19 +623,26 @@ semantics:
   for ``T`` and ``U`` to be incompatible.
 
 The declaration of ``overloadable`` functions is restricted to function
-declarations and definitions.  Most importantly, if any function with a given
-name is given the ``overloadable`` attribute, then all function declarations
-and definitions with that name (and in that scope) must have the
-``overloadable`` attribute.  This rule even applies to redeclarations of
-functions whose original declaration had the ``overloadable`` attribute, e.g.,
+declarations and definitions.  If a function is marked with the ``overloadable``
+attribute, then all declarations and definitions of functions with that name,
+except for at most one (see the note below about unmarked overloads), must have
+the ``overloadable`` attribute.  In addition, redeclarations of a function with
+the ``overloadable`` attribute must have the ``overloadable`` attribute, and
+redeclarations of a function without the ``overloadable`` attribute must *not*
+have the ``overloadable`` attribute. e.g.,
 
 .. code-block:: c
 
   int f(int) __attribute__((overloadable));
   float f(float); // error: declaration of "f" must have the "overloadable" attribute
+  int f(int); // error: redeclaration of "f" must have the "overloadable" attribute
 
   int g(int) __attribute__((overloadable));
   int g(int) { } // error: redeclaration of "g" must also have the "overloadable" attribute
+
+  int h(int);
+  int h(int) __attribute__((overloadable)); // error: declaration of "h" must not
+                                            // have the "overloadable" attribute
 
 Functions marked ``overloadable`` must have prototypes.  Therefore, the
 following code is ill-formed:
@@ -621,7 +676,28 @@ caveats to this use of name mangling:
   linkage specification, it's name *will* be mangled in the same way as it
   would in C.
 
-Query for this feature with ``__has_extension(attribute_overloadable)``.
+For the purpose of backwards compatibility, at most one function with the same
+name as other ``overloadable`` functions may omit the ``overloadable``
+attribute. In this case, the function without the ``overloadable`` attribute
+will not have its name mangled.
+
+For example:
+
+.. code-block:: c
+
+  // Notes with mangled names assume Itanium mangling.
+  int f(int);
+  int f(double) __attribute__((overloadable));
+  void foo() {
+    f(5); // Emits a call to f (not _Z1fi, as it would with an overload that
+          // was marked with overloadable).
+    f(1.0); // Emits a call to _Z1fd.
+  }
+
+Support for unmarked overloads is not present in some versions of clang. You may
+query for it using ``__has_extension(overloadable_unmarked)``.
+
+Query for this attribute with ``__has_attribute(overloadable)``.
   }];
 }
 
@@ -852,13 +928,13 @@ the function declaration for a hypothetical function ``f``:
 
   void f(void) __attribute__((availability(macos,introduced=10.4,deprecated=10.6,obsoleted=10.7)));
 
-The availability attribute states that ``f`` was introduced in Mac OS X 10.4,
-deprecated in Mac OS X 10.6, and obsoleted in Mac OS X 10.7.  This information
+The availability attribute states that ``f`` was introduced in macOS 10.4,
+deprecated in macOS 10.6, and obsoleted in macOS 10.7.  This information
 is used by Clang to determine when it is safe to use ``f``: for example, if
-Clang is instructed to compile code for Mac OS X 10.5, a call to ``f()``
-succeeds.  If Clang is instructed to compile code for Mac OS X 10.6, the call
+Clang is instructed to compile code for macOS 10.5, a call to ``f()``
+succeeds.  If Clang is instructed to compile code for macOS 10.6, the call
 succeeds but Clang emits a warning specifying that the function is deprecated.
-Finally, if Clang is instructed to compile code for Mac OS X 10.7, the call
+Finally, if Clang is instructed to compile code for macOS 10.7, the call
 fails because ``f()`` is no longer available.
 
 The availability attribute is a comma-separated list starting with the
@@ -903,7 +979,7 @@ are:
   command-line arguments.
 
 ``macos``
-  Apple's Mac OS X operating system.  The minimum deployment target is
+  Apple's macOS operating system.  The minimum deployment target is
   specified by the ``-mmacosx-version-min=*version*`` command-line argument.
   ``macosx`` is supported for backward-compatibility reasons, but it is
   deprecated.
@@ -957,6 +1033,19 @@ When one method overrides another, the overriding method can be more widely avai
   - (id)method __attribute__((availability(macos,introduced=10.3))); // okay: method moved into base class later
   - (id)method __attribute__((availability(macos,introduced=10.5))); // error: this method was available via the base class in 10.4
   @end
+
+Starting with the macOS 10.12 SDK, the ``API_AVAILABLE`` macro from
+``<os/availability.h>`` can simplify the spelling:
+
+.. code-block:: objc
+
+  @interface A
+  - (id)method API_AVAILABLE(macos(10.11)));
+  - (id)otherMethod API_AVAILABLE(macos(10.11), ios(11.0));
+  @end
+
+Also see the documentation for `@available
+<http://clang.llvm.org/docs/LanguageExtensions.html#objective-c-available>`_
   }];
 }
 
@@ -1236,6 +1325,62 @@ The semantics are as follows:
 - The parameter sets the interrupt mask for the function corresponding to the
   interrupt level specified. If no mask is specified the interrupt mask
   defaults to "eic".
+  }];
+}
+
+def MicroMipsDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+Clang supports the GNU style ``__attribute__((micromips))`` and
+``__attribute__((nomicromips))`` attributes on MIPS targets. These attributes
+may be attached to a function definition and instructs the backend to generate
+or not to generate microMIPS code for that function.
+
+These attributes override the `-mmicromips` and `-mno-micromips` options
+on the command line.
+  }];
+}
+
+def MipsLongCallStyleDocs : Documentation {
+  let Category = DocCatFunction;
+  let Heading = "long_call (gnu::long_call, gnu::far)";
+  let Content = [{
+Clang supports the ``__attribute__((long_call))``, ``__attribute__((far))``,
+and ``__attribute__((near))`` attributes on MIPS targets. These attributes may
+only be added to function declarations and change the code generated
+by the compiler when directly calling the function. The ``near`` attribute
+allows calls to the function to be made using the ``jal`` instruction, which
+requires the function to be located in the same naturally aligned 256MB
+segment as the caller.  The ``long_call`` and ``far`` attributes are synonyms
+and require the use of a different call sequence that works regardless
+of the distance between the functions.
+
+These attributes have no effect for position-independent code.
+
+These attributes take priority over command line switches such
+as ``-mlong-calls`` and ``-mno-long-calls``.
+  }];
+}
+
+def MipsShortCallStyleDocs : Documentation {
+  let Category = DocCatFunction;
+  let Heading = "short_call (gnu::short_call, gnu::near)";
+  let Content = [{
+Clang supports the ``__attribute__((long_call))``, ``__attribute__((far))``,
+``__attribute__((short__call))``, and ``__attribute__((near))`` attributes
+on MIPS targets. These attributes may only be added to function declarations
+and change the code generated by the compiler when directly calling
+the function. The ``short_call`` and ``near`` attributes are synonyms and
+allow calls to the function to be made using the ``jal`` instruction, which
+requires the function to be located in the same naturally aligned 256MB segment
+as the caller.  The ``long_call`` and ``far`` attributes are synonyms and
+require the use of a different call sequence that works regardless
+of the distance between the functions.
+
+These attributes have no effect for position-independent code.
+
+These attributes take priority over command line switches such
+as ``-mlong-calls`` and ``-mno-long-calls``.
   }];
 }
 
@@ -1963,6 +2108,55 @@ manipulating bits of the enumerator when issuing warnings.
   }];
 }
 
+def EnumExtensibilityDocs : Documentation {
+  let Category = DocCatType;
+  let Content = [{
+Attribute ``enum_extensibility`` is used to distinguish between enum definitions
+that are extensible and those that are not. The attribute can take either
+``closed`` or ``open`` as an argument. ``closed`` indicates a variable of the
+enum type takes a value that corresponds to one of the enumerators listed in the
+enum definition or, when the enum is annotated with ``flag_enum``, a value that
+can be constructed using values corresponding to the enumerators. ``open``
+indicates a variable of the enum type can take any values allowed by the
+standard and instructs clang to be more lenient when issuing warnings.
+
+.. code-block:: c
+
+  enum __attribute__((enum_extensibility(closed))) ClosedEnum {
+    A0, A1
+  };
+
+  enum __attribute__((enum_extensibility(open))) OpenEnum {
+    B0, B1
+  };
+
+  enum __attribute__((enum_extensibility(closed),flag_enum)) ClosedFlagEnum {
+    C0 = 1 << 0, C1 = 1 << 1
+  };
+
+  enum __attribute__((enum_extensibility(open),flag_enum)) OpenFlagEnum {
+    D0 = 1 << 0, D1 = 1 << 1
+  };
+
+  void foo1() {
+    enum ClosedEnum ce;
+    enum OpenEnum oe;
+    enum ClosedFlagEnum cfe;
+    enum OpenFlagEnum ofe;
+
+    ce = A1;           // no warnings
+    ce = 100;          // warning issued
+    oe = B1;           // no warnings
+    oe = 100;          // no warnings
+    cfe = C0 | C1;     // no warnings
+    cfe = C0 | C1 | 4; // warning issued
+    ofe = D0 | D1;     // no warnings
+    ofe = D0 | D1 | 4; // no warnings
+  }
+
+  }];
+}
+
 def EmptyBasesDocs : Documentation {
   let Category = DocCatType;
   let Content = [{
@@ -2134,6 +2328,21 @@ used to specify full unrolling or partial unrolling by a specified amount.
 This is a compiler hint and the compiler may ignore this directive. See
 `OpenCL v2.0 <https://www.khronos.org/registry/cl/specs/opencl-2.0.pdf>`_
 s6.11.5 for details.
+  }];
+}
+
+def OpenCLIntelReqdSubGroupSizeDocs : Documentation {
+  let Category = DocCatStmt;
+  let Heading = "__attribute__((intel_reqd_sub_group_size))";
+  let Content = [{
+The optional attribute intel_reqd_sub_group_size can be used to indicate that
+the kernel must be compiled and executed with the specified subgroup size. When
+this attribute is present, get_max_sub_group_size() is guaranteed to return the
+specified integer value. This is important for the correctness of many subgroup
+algorithms, and in some cases may be used by the compiler to generate more optimal
+code. See `cl_intel_required_subgroup_size
+<https://www.khronos.org/registry/OpenCL/extensions/intel/cl_intel_required_subgroup_size.txt>`
+for details.
   }];
 }
 
@@ -2578,6 +2787,65 @@ hardware design, touch the red zone.
   }];
 }
 
+def AnyX86NoCallerSavedRegistersDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+Use this attribute to indicate that the specified function has no
+caller-saved registers. That is, all registers are callee-saved except for
+registers used for passing parameters to the function or returning parameters
+from the function.
+The compiler saves and restores any modified registers that were not used for 
+passing or returning arguments to the function.
+
+The user can call functions specified with the 'no_caller_saved_registers'
+attribute from an interrupt handler without saving and restoring all
+call-clobbered registers.
+
+Note that 'no_caller_saved_registers' attribute is not a calling convention.
+In fact, it only overrides the decision of which registers should be saved by
+the caller, but not how the parameters are passed from the caller to the callee.
+
+For example:
+
+  .. code-block:: c
+
+    __attribute__ ((no_caller_saved_registers, fastcall))
+    void f (int arg1, int arg2) {
+      ...
+    }
+
+  In this case parameters 'arg1' and 'arg2' will be passed in registers.
+  In this case, on 32-bit x86 targets, the function 'f' will use ECX and EDX as
+  register parameters. However, it will not assume any scratch registers and
+  should save and restore any modified registers except for ECX and EDX.
+  }];
+}
+
+def X86ForceAlignArgPointerDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+Use this attribute to force stack alignment.
+
+Legacy x86 code uses 4-byte stack alignment. Newer aligned SSE instructions
+(like 'movaps') that work with the stack require operands to be 16-byte aligned.
+This attribute realigns the stack in the function prologue to make sure the
+stack can be used with SSE instructions.
+
+Note that the x86_64 ABI forces 16-byte stack alignment at the call site.
+Because of this, 'force_align_arg_pointer' is not needed on x86_64, except in
+rare cases where the caller does not align the stack properly (e.g. flow
+jumps from i386 arch code).
+
+  .. code-block:: c
+
+    __attribute__ ((force_align_arg_pointer))
+    void f () {
+      ...
+    }
+
+  }];
+}
+
 def SwiftCallDocs : Documentation {
   let Category = DocCatVariable;
   let Content = [{
@@ -2719,6 +2987,32 @@ value of type ``T``.
 Making indirect results explicit in the signature allows C functions to
 directly construct objects into them without relying on language
 optimizations like C++'s named return value optimization (NRVO).
+  }];
+}
+
+def SuppressDocs : Documentation {
+  let Category = DocCatStmt;
+  let Content = [{
+The ``[[gsl::suppress]]`` attribute suppresses specific
+clang-tidy diagnostics for rules of the `C++ Core Guidelines`_ in a portable
+way. The attribute can be attached to declarations, statements, and at
+namespace scope.
+
+.. code-block:: c++
+
+  [[gsl::suppress("Rh-public")]]
+  void f_() {
+    int *p;
+    [[gsl::suppress("type")]] {
+      p = reinterpret_cast<int*>(7);
+    }
+  }
+  namespace N {
+    [[clang::suppress("type", "bounds")]];
+    ...
+  }
+
+.. _`C++ Core Guidelines`: https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#inforce-enforcement
   }];
 }
 

@@ -166,6 +166,7 @@ class Parser : public CodeCompletionHandler {
   std::unique_ptr<PragmaHandler> FPContractHandler;
   std::unique_ptr<PragmaHandler> OpenCLExtensionHandler;
   std::unique_ptr<PragmaHandler> OpenMPHandler;
+  std::unique_ptr<PragmaHandler> PCSectionHandler;
   std::unique_ptr<PragmaHandler> MSCommentHandler;
   std::unique_ptr<PragmaHandler> MSDetectMismatchHandler;
   std::unique_ptr<PragmaHandler> MSPointersToMembers;
@@ -183,6 +184,8 @@ class Parser : public CodeCompletionHandler {
   std::unique_ptr<PragmaHandler> LoopHintHandler;
   std::unique_ptr<PragmaHandler> UnrollHintHandler;
   std::unique_ptr<PragmaHandler> NoUnrollHintHandler;
+  std::unique_ptr<PragmaHandler> FPHandler;
+  std::unique_ptr<PragmaHandler> AttributePragmaHandler;
 
   std::unique_ptr<CommentHandler> CommentSemaHandler;
 
@@ -250,6 +253,10 @@ class Parser : public CodeCompletionHandler {
   /// be NULL.
   bool ParsingInObjCContainer;
 
+  /// Whether to skip parsing of function bodies.
+  ///
+  /// This option can be used, for example, to speed up searches for
+  /// declarations/definitions when indexing.
   bool SkipFunctionBodies;
 
   /// The location of the expression statement that is being parsed right now.
@@ -302,8 +309,9 @@ public:
   }
 
   /// ConsumeToken - Consume the current 'peek token' and lex the next one.
-  /// This does not work with special tokens: string literals, code completion
-  /// and balanced tokens must be handled using the specific consume methods.
+  /// This does not work with special tokens: string literals, code completion,
+  /// annotation tokens and balanced tokens must be handled using the specific
+  /// consume methods.
   /// Returns the location of the consumed token.
   SourceLocation ConsumeToken() {
     assert(!isTokenSpecial() &&
@@ -364,7 +372,7 @@ private:
   /// isTokenSpecial - True if this token requires special consumption methods.
   bool isTokenSpecial() const {
     return isTokenStringLiteral() || isTokenParen() || isTokenBracket() ||
-           isTokenBrace() || Tok.is(tok::code_completion);
+           isTokenBrace() || Tok.is(tok::code_completion) || Tok.isAnnotation();
   }
 
   /// \brief Returns true if the current token is '=' or is a type of '='.
@@ -395,7 +403,17 @@ private:
     if (Tok.is(tok::code_completion))
       return ConsumeCodeCompletionTok ? ConsumeCodeCompletionToken()
                                       : handleUnexpectedCodeCompletionToken();
+    if (Tok.isAnnotation())
+      return ConsumeAnnotationToken();
     return ConsumeToken();
+  }
+
+  SourceLocation ConsumeAnnotationToken() {
+    assert(Tok.isAnnotation() && "wrong consume method");
+    SourceLocation Loc = Tok.getLocation();
+    PrevTokLocation = Tok.getAnnotationEndLoc();
+    PP.Lex(Tok);
+    return Loc;
   }
 
   /// ConsumeParen - This consume method keeps the paren count up-to-date.
@@ -549,6 +567,10 @@ private:
   void HandlePragmaFPContract();
 
   /// \brief Handle the annotation token produced for
+  /// #pragma clang fp ...
+  void HandlePragmaFP();
+
+  /// \brief Handle the annotation token produced for
   /// #pragma OPENCL EXTENSION...
   void HandlePragmaOpenCLExtension();
 
@@ -559,6 +581,12 @@ private:
   /// \brief Handle the annotation token produced for
   /// #pragma clang loop and #pragma unroll.
   bool HandlePragmaLoopHint(LoopHint &Hint);
+
+  bool ParsePragmaAttributeSubjectMatchRuleSet(
+      attr::ParsedSubjectMatchRuleSet &SubjectMatchRules,
+      SourceLocation &AnyLoc, SourceLocation &LastMatchRuleEndLoc);
+
+  void HandlePragmaAttribute();
 
   /// GetLookAheadToken - This peeks ahead N tokens and returns that token
   /// without consuming any tokens.  LookAhead(0) returns 'Tok', LookAhead(1)
@@ -580,7 +608,7 @@ public:
   }
 
   /// getTypeAnnotation - Read a parsed type out of an annotation token.
-  static ParsedType getTypeAnnotation(Token &Tok) {
+  static ParsedType getTypeAnnotation(const Token &Tok) {
     return ParsedType::getFromOpaquePtr(Tok.getAnnotationValue());
   }
 
@@ -591,7 +619,7 @@ private:
 
   /// \brief Read an already-translated primary expression out of an annotation
   /// token.
-  static ExprResult getExprAnnotation(Token &Tok) {
+  static ExprResult getExprAnnotation(const Token &Tok) {
     return ExprResult::getFromOpaquePointer(Tok.getAnnotationValue());
   }
 
@@ -794,6 +822,14 @@ private:
 
   /// \brief Consume any extra semi-colons until the end of the line.
   void ConsumeExtraSemi(ExtraSemiKind Kind, unsigned TST = TST_unspecified);
+
+  /// Return false if the next token is an identifier. An 'expected identifier'
+  /// error is emitted otherwise.
+  ///
+  /// The parser tries to recover from the error by checking if the next token
+  /// is a C++ keyword when parsing Objective-C++. Return false if the recovery
+  /// was successful.
+  bool expectIdentifier();
 
 public:
   //===--------------------------------------------------------------------===//
@@ -1429,6 +1465,8 @@ public:
   };
 
   ExprResult ParseExpression(TypeCastState isTypeCast = NotTypeCast);
+  ExprResult ParseConstantExpressionInExprEvalContext(
+      TypeCastState isTypeCast = NotTypeCast);
   ExprResult ParseConstantExpression(TypeCastState isTypeCast = NotTypeCast);
   ExprResult ParseConstraintExpression();
   // Expr that doesn't include commas.
@@ -1449,10 +1487,12 @@ private:
   ExprResult ParseCastExpression(bool isUnaryExpression,
                                  bool isAddressOfOperand,
                                  bool &NotCastExpr,
-                                 TypeCastState isTypeCast);
+                                 TypeCastState isTypeCast,
+                                 bool isVectorLiteral = false);
   ExprResult ParseCastExpression(bool isUnaryExpression,
                                  bool isAddressOfOperand = false,
-                                 TypeCastState isTypeCast = NotTypeCast);
+                                 TypeCastState isTypeCast = NotTypeCast,
+                                 bool isVectorLiteral = false);
 
   /// Returns true if the next token cannot start an expression.
   bool isNotExpressionStart();
@@ -1465,6 +1505,8 @@ private:
             K == tok::period || K == tok::arrow ||
             K == tok::plusplus || K == tok::minusminus);
   }
+
+  bool diagnoseUnknownTemplateId(ExprResult TemplateName, SourceLocation Less);
 
   ExprResult ParsePostfixExpressionSuffix(ExprResult LHS);
   ExprResult ParseUnaryExprOrTypeTraitExpression();
@@ -1479,9 +1521,10 @@ private:
   typedef SmallVector<SourceLocation, 20> CommaLocsTy;
 
   /// ParseExpressionList - Used for C/C++ (argument-)expression-list.
-  bool ParseExpressionList(SmallVectorImpl<Expr *> &Exprs,
-                           SmallVectorImpl<SourceLocation> &CommaLocs,
-                           std::function<void()> Completer = nullptr);
+  bool ParseExpressionList(
+      SmallVectorImpl<Expr *> &Exprs,
+      SmallVectorImpl<SourceLocation> &CommaLocs,
+      llvm::function_ref<void()> Completer = llvm::function_ref<void()>());
 
   /// ParseSimpleExpressionList - A simple comma-separated list of expressions,
   /// used for misc language extensions.
@@ -1814,6 +1857,7 @@ private:
     DSC_trailing, // C++11 trailing-type-specifier in a trailing return type
     DSC_alias_declaration, // C++11 type-specifier-seq in an alias-declaration
     DSC_top_level, // top-level/namespace declaration context
+    DSC_template_param, // template parameter context
     DSC_template_type_arg, // template type argument context
     DSC_objc_method_result, // ObjC method result context, enables 'instancetype'
     DSC_condition // condition declaration context
@@ -1824,6 +1868,7 @@ private:
   static bool isTypeSpecifier(DeclSpecContext DSC) {
     switch (DSC) {
     case DSC_normal:
+    case DSC_template_param:
     case DSC_class:
     case DSC_top_level:
     case DSC_objc_method_result:
@@ -1844,6 +1889,7 @@ private:
   static bool isClassTemplateDeductionContext(DeclSpecContext DSC) {
     switch (DSC) {
     case DSC_normal:
+    case DSC_template_param:
     case DSC_class:
     case DSC_top_level:
     case DSC_condition:
@@ -2567,6 +2613,9 @@ private:
       Decl *TagDecl = nullptr);
   /// \brief Parse 'omp declare reduction' construct.
   DeclGroupPtrTy ParseOpenMPDeclareReductionDirective(AccessSpecifier AS);
+  /// Parses initializer for provided omp_priv declaration inside the reduction
+  /// initializer.
+  void ParseOpenMPReductionInitializerForDecl(VarDecl *OmpPrivParm);
 
   /// \brief Parses simple list of variables.
   ///
@@ -2679,11 +2728,11 @@ private:
                                        AccessSpecifier AS=AS_none,
                                        AttributeList *AccessAttrs = nullptr);
   bool ParseTemplateParameters(unsigned Depth,
-                               SmallVectorImpl<Decl*> &TemplateParams,
+                               SmallVectorImpl<NamedDecl *> &TemplateParams,
                                SourceLocation &LAngleLoc,
                                SourceLocation &RAngleLoc);
   bool ParseTemplateParameterList(unsigned Depth,
-                                  SmallVectorImpl<Decl*> &TemplateParams);
+                                  SmallVectorImpl<NamedDecl*> &TemplateParams);
   bool isStartOfTemplateTypeParameter();
   Decl *ParseTemplateParameter(unsigned Depth, unsigned Position);
   Decl *ParseTypeParameter(unsigned Depth, unsigned Position);
@@ -2701,10 +2750,7 @@ private:
   bool ParseGreaterThanInTemplateList(SourceLocation &RAngleLoc,
                                       bool ConsumeLastToken,
                                       bool ObjCGenericList);
-  bool ParseTemplateIdAfterTemplateName(TemplateTy Template,
-                                        SourceLocation TemplateNameLoc,
-                                        const CXXScopeSpec &SS,
-                                        bool ConsumeLastToken,
+  bool ParseTemplateIdAfterTemplateName(bool ConsumeLastToken,
                                         SourceLocation &LAngleLoc,
                                         TemplateArgList &TemplateArgs,
                                         SourceLocation &RAngleLoc);

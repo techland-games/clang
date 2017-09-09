@@ -214,7 +214,7 @@ public:
 
   bool UseObjCMixedDispatch() const override { return true; }
 
-  bool IsUnwindTablesDefault() const override;
+  bool IsUnwindTablesDefault(const llvm::opt::ArgList &Args) const override;
 
   RuntimeLibType GetDefaultRuntimeLibType() const override {
     return ToolChain::RLT_CompilerRT;
@@ -382,6 +382,15 @@ protected:
     return TargetVersion < VersionTuple(V0, V1, V2);
   }
 
+  /// Return true if c++17 aligned allocation/deallocation functions are not
+  /// implemented in the c++ standard library of the deployment target we are
+  /// targeting.
+  bool isAlignedAllocationUnavailable() const;
+
+  void addClangTargetOptions(const llvm::opt::ArgList &DriverArgs,
+                             llvm::opt::ArgStringList &CC1Args,
+                             Action::OffloadKind DeviceOffloadKind) const override;
+
   StringRef getPlatformFamily() const;
   static StringRef getSDKName(StringRef isysroot);
   StringRef getOSLibraryNameSuffix() const;
@@ -478,7 +487,8 @@ public:
 private:
   void AddLinkSanitizerLibArgs(const llvm::opt::ArgList &Args,
                                llvm::opt::ArgStringList &CmdArgs,
-                               StringRef Sanitizer) const;
+                               StringRef Sanitizer,
+                               bool shared = true) const;
 };
 
 } // end namespace toolchains

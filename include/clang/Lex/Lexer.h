@@ -463,6 +463,10 @@ public:
   /// \brief Returns true if the given character could appear in an identifier.
   static bool isIdentifierBodyChar(char c, const LangOptions &LangOpts);
 
+  /// \brief Checks whether new line pointed by Str is preceded by escape
+  /// sequence.
+  static bool isNewLineEscaped(const char *BufferStart, const char *Str);
+
   /// getCharAndSizeNoWarn - Like the getCharAndSize method, but does not ever
   /// emit a warning.
   static inline char getCharAndSizeNoWarn(const char *Ptr, unsigned &Size,
@@ -477,6 +481,11 @@ public:
     Size = 0;
     return getCharAndSizeSlowNoWarn(Ptr, Size, LangOpts);
   }
+
+  /// Returns the leading whitespace for line that corresponds to the given
+  /// location \p Loc.
+  static StringRef getIndentationForLine(SourceLocation Loc,
+                                         const SourceManager &SM);
 
   //===--------------------------------------------------------------------===//
   // Internal implementation interfaces.
@@ -637,6 +646,8 @@ private:
   
   bool IsStartOfConflictMarker(const char *CurPtr);
   bool HandleEndOfConflictMarker(const char *CurPtr);
+
+  bool lexEditorPlaceholder(Token &Result, const char *CurPtr);
 
   bool isCodeCompletionPoint(const char *CurPtr) const;
   void cutOffLexing() { BufferPtr = BufferEnd; }
